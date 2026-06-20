@@ -505,10 +505,24 @@ class VariantAnalyzer:
         if clinvar_data and clinvar_data.get("gene_symbol"):
             gene = clinvar_data.get("gene_symbol")
         elif myvariant_data:
+            snpeff_ann = myvariant_data.get('snpeff', {}).get('ann', [])
+            snpeff_gene = None
+            if isinstance(snpeff_ann, list) and snpeff_ann:
+                snpeff_gene = snpeff_ann[0].get('genename') if isinstance(snpeff_ann[0], dict) else None
+            elif isinstance(snpeff_ann, dict):
+                snpeff_gene = snpeff_ann.get('genename')
+
+            dbnsfp_gene = myvariant_data.get('dbnsfp', {}).get('genename')
+            dbnsfp_gene_str = None
+            if isinstance(dbnsfp_gene, str):
+                dbnsfp_gene_str = dbnsfp_gene
+            elif isinstance(dbnsfp_gene, list) and dbnsfp_gene:
+                dbnsfp_gene_str = dbnsfp_gene[0]
+
             gene_candidates = [
                 myvariant_data.get('clinvar', {}).get('gene', {}).get('symbol'),
-                myvariant_data.get('snpeff', {}).get('ann', [{}])[0].get('genename'),
-                myvariant_data.get('dbnsfp', {}).get('genename')
+                snpeff_gene,
+                dbnsfp_gene_str
             ]
             for candidate in gene_candidates:
                 if candidate:

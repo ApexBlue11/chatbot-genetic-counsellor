@@ -1,8 +1,7 @@
-# Core dependencies
-streamlit>=1.28.0,<2.0.0
-pandas>=2.1.0,<3.0.0
-requests>=2.31.0,<3.0.0
-google-generativeai>=0.3.0,<1.0.0
-python-dotenv>=1.0.0,<2.0.0
-numpy>=1.24.3,<3.0.0
-Pillow>=10.0.0,<11.0.0
+streamlit
+pandas
+requests
+google-generativeai
+python-dotenv
+numpy
+Pillow

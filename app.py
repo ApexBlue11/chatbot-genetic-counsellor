@@ -294,7 +294,7 @@ def call_gemini_api(prompt: str, api_key: str, context: List[Dict[str, str]]) ->
 
 def generate_summary_prompt(clingen_data: Dict, myvariant_data: Dict, vep_data: List) -> str:
     """Creates a detailed prompt for the AI to summarize the variant data."""
-    if myvariant_data and 'dbnsfp' in myvariant_data:
+    if myvariant_data and isinstance(myvariant_data, dict) and 'dbnsfp' in myvariant_data and isinstance(myvariant_data['dbnsfp'], dict):
         myvariant_data['dbnsfp'] = {
             k: v for k, v in myvariant_data['dbnsfp'].items()
             if k in ['sift', 'polyphen2_hdiv', 'polyphen2_hvar', 'cadd', 'revel', 'gerp++_rs']
@@ -420,85 +420,82 @@ def parse_caid_minimal(raw_json):
             break
     return result
 
+def clean_ui_label(label: str) -> str:
+    """Helper to convert underscore labels to Title Case."""
+    if not label or not isinstance(label, str):
+        return label
+    return label.replace('_', ' ').title()
+
+AMINO_ACIDS_MAP = {
+    'A': 'Ala', 'R': 'Arg', 'N': 'Asn', 'D': 'Asp', 'C': 'Cys',
+    'E': 'Glu', 'Q': 'Gln', 'G': 'Gly', 'H': 'His', 'I': 'Ile',
+    'L': 'Leu', 'K': 'Lys', 'M': 'Met', 'F': 'Phe', 'P': 'Pro',
+    'S': 'Ser', 'T': 'Thr', 'W': 'Trp', 'Y': 'Tyr', 'V': 'Val',
+    'X': 'X'
+}
+
+def format_amino_acids(aa_str: str) -> str:
+    """Format single-letter amino acid changes (e.g. A/G -> A/G (Ala → Gly))."""
+    if not aa_str or not isinstance(aa_str, str) or '/' not in aa_str:
+        return aa_str
+    parts = aa_str.split('/')
+    if len(parts) == 2:
+        ref_aa = AMINO_ACIDS_MAP.get(parts[0].upper(), parts[0])
+        alt_aa = AMINO_ACIDS_MAP.get(parts[1].upper(), parts[1])
+        return f"{aa_str} ({ref_aa} → {alt_aa})"
+    return aa_str
+
 def get_variant_annotations(clingen_data, classification=None):
-    """Retrieve variant annotations from multiple APIs."""
+    """Retrieve variant annotations from multiple APIs using core clients."""
     annotations = {'myvariant_data': {}, 'vep_data': [], 'errors': []}
-    query_id = None
-    if clingen_data.get('myvariant_hg38'):
-        query_id = clingen_data['myvariant_hg38']
-    elif classification and classification.query_type == 'rsid':
-        query_id = classification.extracted_identifier
-    if query_id:
-        try:
-            with st.spinner("Fetching MyVariant.info data..."):
-                myv_url = f"https://myvariant.info/v1/variant/{query_id}?assembly=hg38"
-                myv_response = requests.get(myv_url, timeout=30)
-                if myv_response.ok:
-                    myv_raw = myv_response.json()
-                    if isinstance(myv_raw, list) and len(myv_raw) > 0:
-                        myv_raw = myv_raw[0]
-                    annotations['myvariant_data'] = myv_raw
-                else:
-                    annotations['errors'].append(f"MyVariant query failed: HTTP {myv_response.status_code}")
-        except Exception as e:
-            annotations['errors'].append(f"MyVariant query error: {str(e)}")
-    vep_input = None
-    vep_attempted = False
+    
+    # 1. Determine MyVariant query ID
+    myvariant_query_id = clingen_data.get('myvariant_hg38')
+    if not myvariant_query_id and classification and classification.query_type == 'rsid':
+        myvariant_query_id = classification.extracted_identifier
+        
+    if myvariant_query_id:
+        with st.spinner("Fetching MyVariant.info data..."):
+            from core.api_clients import query_myvariant
+            myv_raw = query_myvariant(myvariant_query_id)
+            if "error" in myv_raw:
+                annotations['errors'].append(myv_raw["error"])
+            else:
+                annotations['myvariant_data'] = myv_raw
+                
+    # 2. Determine VEP query ID
+    from core.api_clients import query_vep
+    vep_data = None
+    
     if clingen_data.get('mane_ensembl'):
-        vep_input = clingen_data['mane_ensembl']
-        vep_attempted = True
-        try:
-            with st.spinner("Fetching Ensembl VEP data..."):
-                vep_url = f"https://rest.ensembl.org/vep/human/hgvs/{vep_input}"
-                vep_headers = {"Content-Type": "application/json", "Accept": "application/json"}
-                vep_response = requests.get(vep_url, headers=vep_headers, timeout=30)
-                if vep_response.ok:
-                    annotations['vep_data'] = vep_response.json()
-                else:
-                    annotations['errors'].append(f"VEP query with MANE transcript failed: HTTP {vep_response.status_code}")
-        except Exception as e:
-            annotations['errors'].append(f"VEP query with MANE transcript error: {str(e)}")
-    if (classification and classification.query_type == 'rsid' and not annotations['vep_data'] and not vep_attempted):
-        vep_input = classification.extracted_identifier
-        vep_attempted = True
-        try:
-            with st.spinner("Fetching Ensembl VEP data with RSID..."):
-                vep_url = f"https://rest.ensembl.org/vep/human/hgvs/{vep_input}"
-                vep_headers = {"Content-Type": "application/json", "Accept": "application/json"}
-                vep_response = requests.get(vep_url, headers=vep_headers, timeout=30)
-                if vep_response.ok:
-                    annotations['vep_data'] = vep_response.json()
-                else:
-                    annotations['errors'].append(f"VEP query with RSID failed: HTTP {vep_response.status_code}")
-        except Exception as e:
-            annotations['errors'].append(f"VEP query with RSID error: {str(e)}")
-    if (not annotations['vep_data'] and annotations['myvariant_data'] and isinstance(annotations['myvariant_data'], dict)):
+        with st.spinner("Fetching Ensembl VEP data..."):
+            vep_data = query_vep(clingen_data['mane_ensembl'])
+            
+    if (not vep_data or "error" in vep_data) and classification and classification.query_type == 'rsid':
+        with st.spinner("Fetching Ensembl VEP data with RSID..."):
+            vep_data = query_vep(classification.extracted_identifier)
+            
+    if (not vep_data or "error" in vep_data) and annotations['myvariant_data']:
         dbnsfp = annotations['myvariant_data'].get('dbnsfp', {})
         ensembl_data = dbnsfp.get('ensembl', {})
         transcript_ids = ensembl_data.get('transcriptid', [])
         if transcript_ids:
-            if isinstance(transcript_ids, list) and len(transcript_ids) > 0:
-                primary_transcript = transcript_ids[0]
-            else:
-                primary_transcript = transcript_ids
+            primary_transcript = transcript_ids[0] if isinstance(transcript_ids, list) else transcript_ids
             hgvs_coding = dbnsfp.get('hgvsc')
             if hgvs_coding:
-                if isinstance(hgvs_coding, list):
-                    hgvs_coding = hgvs_coding[0]
+                hgvs_coding = hgvs_coding[0] if isinstance(hgvs_coding, list) else hgvs_coding
                 vep_hgvs = f"{primary_transcript}:{hgvs_coding}"
-                try:
-                    with st.spinner(f"Fetching VEP data with Ensembl transcript {primary_transcript}..."):
-                        vep_url = f"https://rest.ensembl.org/vep/human/hgvs/{vep_hgvs}"
-                        vep_headers = {"Content-Type": "application/json", "Accept": "application/json"}
-                        vep_response = requests.get(vep_url, headers=vep_headers, timeout=30)
-                        if vep_response.ok:
-                            annotations['vep_data'] = vep_response.json()
-                            annotations['vep_fallback_used'] = True
-                            st.success(f"VEP fallback successful using transcript {primary_transcript}")
-                        else:
-                            annotations['errors'].append(f"VEP fallback query failed: HTTP {vep_response.status_code}")
-                except Exception as e:
-                    annotations['errors'].append(f"VEP fallback query error: {str(e)}")
+                with st.spinner(f"Fetching VEP data with Ensembl transcript {primary_transcript}..."):
+                    vep_data = query_vep(vep_hgvs)
+                    if vep_data and "error" not in vep_data:
+                        annotations['vep_fallback_used'] = True
+                        st.success(f"VEP fallback successful using transcript {primary_transcript}")
+
+    if vep_data and "error" not in vep_data:
+        annotations['vep_data'] = vep_data
+    elif vep_data and "error" in vep_data:
+        annotations['errors'].append(vep_data["error"])
+        
     return annotations
 
 def select_primary_vep_transcript(vep_data):
@@ -523,7 +520,7 @@ def select_primary_vep_transcript(vep_data):
 
 def display_vep_analysis(vep_data):
     """Display comprehensive VEP analysis."""
-    if not vep_data or not vep_data[0].get('transcript_consequences'):
+    if not vep_data or not isinstance(vep_data, list) or not vep_data[0].get('transcript_consequences'):
         st.warning("No VEP data available")
         return
     variant_info = vep_data[0]
@@ -540,16 +537,16 @@ def display_vep_analysis(vep_data):
         col1, col2, col3 = st.columns(3)
         with col1:
             consequences = primary_transcript.get('consequence_terms', [])
-            st.write(f"**Consequence:** {', '.join(consequences)}")
+            st.write(f"**Consequence:** {', '.join(clean_ui_label(c) for c in consequences)}")
         with col2:
-            st.write(f"**Impact:** {primary_transcript.get('impact', 'N/A')}")
+            st.write(f"**Impact:** {clean_ui_label(primary_transcript.get('impact', 'N/A'))}")
         with col3:
-            st.write(f"**Biotype:** {primary_transcript.get('biotype', 'N/A')}")
+            st.write(f"**Biotype:** {clean_ui_label(primary_transcript.get('biotype', 'N/A'))}")
         if primary_transcript.get('amino_acids'):
             st.subheader("Sequence Changes")
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.write(f"**Amino Acid Change:** {primary_transcript.get('amino_acids', 'N/A')}")
+                st.write(f"**Amino Acid Change:** {format_amino_acids(primary_transcript.get('amino_acids', 'N/A'))}")
                 st.write(f"**Position:** {primary_transcript.get('protein_start', 'N/A')}")
             with col2:
                 st.write(f"**Codon Change:** {primary_transcript.get('codons', 'N/A')}")
@@ -560,13 +557,15 @@ def display_vep_analysis(vep_data):
             st.subheader("Functional Predictions")
             col1, col2 = st.columns(2)
             with col1:
-                if primary_transcript.get('sift_score'):
+                if primary_transcript.get('sift_score') is not None:
                     st.metric("SIFT Score", f"{primary_transcript['sift_score']:.3f}")
-                    st.write(f"**SIFT Prediction:** {primary_transcript.get('sift_prediction', 'N/A')}")
+                    st.write(f"**SIFT Prediction:** {clean_ui_label(primary_transcript.get('sift_prediction', 'N/A'))}")
+                    st.caption("ℹ️ **SIFT Scale**: 0.0 (deleterious) to 1.0 (tolerated). Threshold: ≤ 0.05 is Deleterious.")
             with col2:
-                if primary_transcript.get('polyphen_score'):
+                if primary_transcript.get('polyphen_score') is not None:
                     st.metric("PolyPhen Score", f"{primary_transcript['polyphen_score']:.3f}")
-                    st.write(f"**PolyPhen Prediction:** {primary_transcript.get('polyphen_prediction', 'N/A')}")
+                    st.write(f"**PolyPhen Prediction:** {clean_ui_label(primary_transcript.get('polyphen_prediction', 'N/A'))}")
+                    st.caption("ℹ️ **PolyPhen-2 Scale**: 0.0 (benign) to 1.0 (damaging). Thresholds: 0.0–0.446 Benign, 0.447–0.908 Possibly Damaging, 0.909–1.0 Probably Damaging.")
     with st.expander(f"View All {len(all_transcripts)} Transcripts", expanded=False):
         for i, transcript in enumerate(all_transcripts, 1):
             with st.container():
@@ -580,21 +579,21 @@ def display_vep_analysis(vep_data):
                     st.write(f"**Gene:** {transcript.get('gene_symbol', 'N/A')}")
                     if special_flags: st.success(f" {', '.join(special_flags)}")
                 with col2:
-                    st.write(f"**Consequence:** {', '.join(transcript.get('consequence_terms', []))}")
-                    st.write(f"**Impact:** {transcript.get('impact', 'N/A')}")
+                    st.write(f"**Consequence:** {', '.join(clean_ui_label(c) for c in transcript.get('consequence_terms', []))}")
+                    st.write(f"**Impact:** {clean_ui_label(transcript.get('impact', 'N/A'))}")
                 with col3:
-                    st.write(f"**Biotype:** {transcript.get('biotype', 'N/A')}")
+                    st.write(f"**Biotype:** {clean_ui_label(transcript.get('biotype', 'N/A'))}")
                     if transcript.get('distance'): st.write(f"**Distance:** {transcript.get('distance', 'N/A')}")
                 with col4:
                     if transcript.get('amino_acids'):
-                        st.write(f"**AA Change:** {transcript.get('amino_acids', 'N/A')}")
+                        st.write(f"**AA Change:** {format_amino_acids(transcript.get('amino_acids', 'N/A'))}")
                         st.write(f"**Position:** {transcript.get('protein_start', 'N/A')}")
                 if transcript.get('sift_score') or transcript.get('polyphen_score'):
                     pred_col1, pred_col2 = st.columns(2)
                     with pred_col1:
-                        if transcript.get('sift_score'): st.write(f"**SIFT:** {transcript['sift_score']:.3f} ({transcript.get('sift_prediction', 'N/A')})")
+                        if transcript.get('sift_score') is not None: st.write(f"**SIFT:** {transcript['sift_score']:.3f} ({clean_ui_label(transcript.get('sift_prediction', 'N/A'))})")
                     with pred_col2:
-                        if transcript.get('polyphen_score'): st.write(f"**PolyPhen:** {transcript['polyphen_score']:.3f} ({transcript.get('polyphen_prediction', 'N/A')})")
+                        if transcript.get('polyphen_score') is not None: st.write(f"**PolyPhen:** {transcript['polyphen_score']:.3f} ({clean_ui_label(transcript.get('polyphen_prediction', 'N/A'))})")
                 st.markdown("---")
 
 def display_comprehensive_myvariant_data(myvariant_data):
@@ -613,7 +612,7 @@ def display_comprehensive_myvariant_data(myvariant_data):
         st.error("Unexpected data format from MyVariant")
         return
 
-    data_tabs = st.tabs([" Basic Info", " Functional Predictions", " Population Frequencies", " ClinVar", " External DBs"])
+    data_tabs = st.tabs([" Basic Info", " Pathogenicity Predictors", " Population Frequencies", " ClinVar", " External DBs"])
 
     with data_tabs[0]:  # Basic Info
         st.subheader("Variant Information")
@@ -630,10 +629,26 @@ def display_comprehensive_myvariant_data(myvariant_data):
             st.write(f"**Reference:** {ref}")
             st.write(f"**Alternate:** {alt}")
         with col3:
-            gene_name = (myvariant_data.get('clinvar', {}).get('gene', {}).get('symbol') or
-                         myvariant_data.get('snpeff', {}).get('ann', [{}])[0].get('genename') or
-                         (myvariant_data.get('dbnsfp', {}).get('genename') if isinstance(myvariant_data.get('dbnsfp', {}).get('genename'), str) else None) or
-                         (myvariant_data.get('dbnsfp', {}).get('genename', [None])[0] if isinstance(myvariant_data.get('dbnsfp', {}).get('genename'), list) else None) or 'N/A')
+            snpeff_ann = myvariant_data.get('snpeff', {}).get('ann', [])
+            snpeff_gene = None
+            if isinstance(snpeff_ann, list) and snpeff_ann:
+                snpeff_gene = snpeff_ann[0].get('genename') if isinstance(snpeff_ann[0], dict) else None
+            elif isinstance(snpeff_ann, dict):
+                snpeff_gene = snpeff_ann.get('genename')
+
+            dbnsfp_gene = myvariant_data.get('dbnsfp', {}).get('genename')
+            dbnsfp_gene_str = None
+            if isinstance(dbnsfp_gene, str):
+                dbnsfp_gene_str = dbnsfp_gene
+            elif isinstance(dbnsfp_gene, list) and dbnsfp_gene:
+                dbnsfp_gene_str = dbnsfp_gene[0]
+
+            gene_name = (
+                myvariant_data.get('clinvar', {}).get('gene', {}).get('symbol') or
+                snpeff_gene or
+                dbnsfp_gene_str or
+                'N/A'
+            )
 
             st.write(f"**Gene:** {gene_name}")
             rsid = myvariant_data.get('rsid') or myvariant_data.get('dbsnp', {}).get('rsid') or 'N/A'
@@ -1107,38 +1122,57 @@ with tab3:
                             annotations['myvariant_data'] = {}
                         annotations['myvariant_data']['clinvar'] = variant_data.get('clinvar_data', {})
                     elif classification.query_type == 'rsid':
-                        st.info(" RSID detected - querying MyVariant.info and Ensembl VEP directly")
-                        clingen_data = {
-                            'CAid': 'N/A (RSID input)', 
-                            'rsid': classification.extracted_identifier.replace('rs', ''), 
-                            'genomic_hgvs_grch38': None,
-                            'genomic_hgvs_grch37': None, 
-                            'myvariant_hg38': None, 
-                            'myvariant_hg19': None, 
-                            'mane_ensembl': None, 
-                            'mane_refseq': None
-                        }
+                        st.info(" 🔍 RSID detected - querying ClinGen Allele Registry by rsID to resolve MANE and coordinate aliases...")
+                        rs_num = classification.extracted_identifier.replace('rs', '')
+                        clingen_data = None
+                        try:
+                            clingen_search_url = f"https://reg.clinicalgenome.org/alleles?dbSNP.rs={rs_num}"
+                            headers = {"Accept": "application/json"}
+                            search_resp = requests.get(clingen_search_url, headers=headers, timeout=15)
+                            if search_resp.ok:
+                                urls = search_resp.json()
+                                if isinstance(urls, list) and urls:
+                                    allele_url = urls[0]
+                                    allele_resp = requests.get(allele_url, headers=headers, timeout=15)
+                                    if allele_resp.ok:
+                                        clingen_raw = allele_resp.json()
+                                        clingen_data = parse_caid_minimal(clingen_raw)
+                                        st.success(" ✅ Successfully resolved RSID aliases from ClinGen Allele Registry!")
+                        except Exception as e:
+                            st.warning(f"Could not resolve RSID via ClinGen Allele Registry: {str(e)}")
+
+                        if not clingen_data:
+                            clingen_data = {
+                                'CAid': 'N/A (RSID input)', 
+                                'rsid': rs_num, 
+                                'genomic_hgvs_grch38': None,
+                                'genomic_hgvs_grch37': None, 
+                                'myvariant_hg38': None, 
+                                'myvariant_hg19': None, 
+                                'mane_ensembl': None, 
+                                'mane_refseq': None
+                            }
+                        
                         annotations = get_variant_annotations(clingen_data, classification)
                         
-                        # Try to get better VEP data
-                        if annotations['myvariant_data']:
+                        # Try to get better VEP data if not already retrieved via MANE Select
+                        if not annotations.get('vep_data') and annotations['myvariant_data']:
                             myv_data = annotations['myvariant_data']
                             if isinstance(myv_data, list) and len(myv_data) > 0:
                                 myv_data = myv_data[0]
                                 annotations['myvariant_data'] = myv_data
                             
                             if isinstance(myv_data, dict):
-                                if myv_data.get('clingen', {}).get('caid'): 
+                                if myv_data.get('clingen', {}).get('caid') and clingen_data['CAid'].startswith('N/A'): 
                                     clingen_data['CAid'] = myv_data['clingen']['caid']
                                 
                                 hgvs_data = myv_data.get('clinvar', {}).get('hgvs', {})
                                 if isinstance(hgvs_data, dict) and hgvs_data.get('coding'):
                                     try:
-                                        vep_url = f"https://rest.ensembl.org/vep/human/hgvs/{hgvs_data['coding']}"
-                                        vep_headers = {"Content-Type": "application/json", "Accept": "application/json"}
-                                        vep_response = requests.get(vep_url, headers=vep_headers, timeout=30)
-                                        if vep_response.ok: 
-                                            annotations['vep_data'] = vep_response.json()
+                                        from core.api_clients import query_vep
+                                        vep_data = query_vep(hgvs_data['coding'])
+                                        if vep_data and "error" not in vep_data:
+                                            annotations['vep_data'] = vep_data
                                     except: 
                                         pass
                     else:
