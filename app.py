@@ -729,6 +729,35 @@ def display_comprehensive_myvariant_data(myvariant_data):
             else:
                 st.info(f"No {category.lower()} data available")
 
+        # Add interpretation guide at the bottom of data_tabs[1]
+        st.markdown("---")
+        with st.expander("📖 View Official Pathogenicity & Conservation Scores Guide", expanded=False):
+            st.markdown(r"""
+            ### Official Pathogenicity & Conservation Scores Guide
+            
+            Below are the official scales and clinical interpretation thresholds (from dbNSFP guidelines):
+            
+            | Category | Predictor | Official Scale Range | Pathogenicity / Conservation Threshold |
+            | :--- | :--- | :--- | :--- |
+            | **Pathogenicity** | **SIFT** | `0.0` (deleterious) to `1.0` (tolerated) | Score $\le$ 0.05 is Deleterious |
+            | | **PolyPhen-2 (HDiv / HVar)** | `0.0` (benign) to `1.0` (damaging) | HDiv: $\ge$ 0.957 Probably, $\ge$ 0.453 Possibly Damaging. <br>HVar: $\ge$ 0.909 Probably, $\ge$ 0.447 Possibly Damaging. |
+            | | **FATHMM** | `-15.0` to `15.0` | Score $\le$ -1.5 is Damaging (disease-specific weighted) |
+            | | **MutationTaster** | `0.0` to `1.0` | A: Automatic Disease Causing, D: Disease Causing, N: Polymorphism |
+            | | **MutationAssessor** | `-5.5` to `5.9` | Score > 1.9 is Medium/High functional impact |
+            | | **PROVEAN** | `-14.0` to `14.0` | Score $\le$ -2.5 is Damaging |
+            | | **MetaSVM / MetaLR** | `0.0` to `1.0` (ensemble probability) | Score $\ge$ 0.5 is Damaging |
+            | | **M-CAP** | `0.0` to `1.0` | Score > 0.025 is Pathogenic |
+            | | **REVEL** | `0.0` to `1.0` (ensemble score) | Score $\ge$ 0.85 is strongly pathogenic |
+            | | **MutPred2** | `0.0` to `1.0` | Score $\ge$ 0.5 is Pathogenic |
+            | | **ClinPred** | `0.0` to `1.0` | Score > 0.5 indicates clinical pathogenicity |
+            | | **AlphaMissense** | `0.0` to `1.0` (Google DeepMind) | Score $\ge$ 0.564 likely pathogenic, $\le$ 0.340 likely benign |
+            | **Ensemble** | **CADD Phred** | `1.0` to `99.0` (scaled score) | Score $\ge$ 20 is top 1% deleterious, $\ge$ 30 is top 0.1% |
+            | | **DANN** | `0.0` to `1.0` | Score > 0.9 indicates high functional impact |
+            | **Conservation** | **GERP++ RS** | `-12.3` to `6.17` | Score > 2 indicates evolutionary constraint (conserved) |
+            | | **PhyloP (100way / 470way)** | Negative (evolved) to Positive (conserved) | Score > 1.6 indicates evolutionary conservation |
+            | | **PhastCons** | `0.0` to `1.0` | Score > 0.8 is highly conserved |
+            """)
+
     with data_tabs[2]: # Population Frequencies
         st.subheader("Population Frequency Data")
         freq_tabs = st.tabs(["gnomAD Exome", "gnomAD Genome", "1000 Genomes", "ExAC", "Raw Data"])
@@ -854,7 +883,18 @@ def display_comprehensive_myvariant_data(myvariant_data):
         if not clinvar_data:
             st.info("No ClinVar data available")
             return
-        clinical_sig = (clinvar_data.get('clinical_significance') or clinvar_data.get('clnsig') or 'N/A')
+        
+        clinical_sig = clinvar_data.get('clinical_significance') or clinvar_data.get('clnsig')
+        if not clinical_sig and isinstance(clinvar_data.get('rcv'), list) and clinvar_data['rcv']:
+            sig_list = []
+            for rcv in clinvar_data['rcv']:
+                if isinstance(rcv, dict) and rcv.get('clinical_significance'):
+                    sig_list.append(rcv['clinical_significance'])
+            if sig_list:
+                clinical_sig = "; ".join(list(set(sig_list)))
+        if not clinical_sig:
+            clinical_sig = 'N/A'
+            
         col1, col2 = st.columns(2)
         with col1:
             st.write(f"**Clinical Significance:** {clinical_sig}")
@@ -918,9 +958,17 @@ def display_comprehensive_myvariant_data(myvariant_data):
                             st.write(f"- {gene.get('symbol', 'N/A')} (ID: {gene.get('geneid', 'N/A')})")
         uniprot_data = myvariant_data.get('uniprot', {})
         if uniprot_data:
-            st.markdown("#### UniProt")
-            if uniprot_data.get('clinical_significance'): st.write(f"**Clinical Significance:** {uniprot_data['clinical_significance']}")
-            if uniprot_data.get('source_db_id'): st.write(f"**Source DB ID:** {uniprot_data['source_db_id']}")
+            st.markdown("#### UniProt Reference")
+            if isinstance(uniprot_data, dict):
+                humsavar = uniprot_data.get('humsavar', {})
+                if isinstance(humsavar, dict):
+                    if humsavar.get('type_of_variant'): st.write(f"**Variant Type:** {humsavar['type_of_variant']}")
+                    if humsavar.get('swiss_prot_ac'): st.write(f"**SwissProt Accession:** [{humsavar['swiss_prot_ac']}](https://www.uniprot.org/uniprotkb/{humsavar['swiss_prot_ac']})")
+                    if humsavar.get('ftid'): st.write(f"**Feature ID (FTID):** {humsavar['ftid']}")
+                if uniprot_data.get('clinical_significance'): st.write(f"**Clinical Significance:** {uniprot_data['clinical_significance']}")
+                if uniprot_data.get('source_db_id'): st.write(f"**Source DB ID:** {uniprot_data['source_db_id']}")
+                if uniprot_data.get('swiss_prot_ac') and not humsavar.get('swiss_prot_ac'):
+                    st.write(f"**SwissProt Accession:** [{uniprot_data['swiss_prot_ac']}](https://www.uniprot.org/uniprotkb/{uniprot_data['swiss_prot_ac']})")
 
 # ==================== MAIN APPLICATION ====================
 
@@ -1318,7 +1366,16 @@ with tab3:
                     
                     if clinvar_data:
                         st.subheader(" ClinVar Clinical Significance")
-                        clinical_sig = clinvar_data.get('clinical_significance') or clinvar_data.get('clnsig') or 'Not Available'
+                        clinical_sig = clinvar_data.get('clinical_significance') or clinvar_data.get('clnsig')
+                        if not clinical_sig and isinstance(clinvar_data.get('rcv'), list) and clinvar_data['rcv']:
+                            sig_list = []
+                            for rcv in clinvar_data['rcv']:
+                                if isinstance(rcv, dict) and rcv.get('clinical_significance'):
+                                    sig_list.append(rcv['clinical_significance'])
+                            if sig_list:
+                                clinical_sig = "; ".join(list(set(sig_list)))
+                        if not clinical_sig:
+                            clinical_sig = 'Not Available'
                         
                         # Color-code significance
                         if 'pathogenic' in clinical_sig.lower() and 'benign' not in clinical_sig.lower():
