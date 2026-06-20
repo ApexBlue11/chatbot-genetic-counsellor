@@ -35,4 +35,9 @@ class GenomicQueryRouter:
         rsid = re.search(self.RSID_PATTERN, query, re.IGNORECASE)
         if rsid:
             return QueryClassification(True, "rsid", rsid.group(1))
+        
+        # Match potential gene symbols (2-10 alphanumeric characters, excluding rsIDs)
+        if re.match(r"^[A-Za-z0-9]{2,10}$", query) and not query.lower().startswith("rs"):
+            return QueryClassification(True, "gene_symbol", query.upper())
+            
         return QueryClassification(False, "general", None)

@@ -37,7 +37,23 @@ class VariantDataFetcher:
         }
         
         try:
-            if query_type == 'rsid':
+            if query_type == 'gene_symbol':
+                # Query ClinVar directly for the gene symbol
+                result["clinvar_data"] = query_clinvar(gene_symbol=variant_id)
+                # Use the representative rsid of the matched variant to query other databases
+                rep_rsid = result["clinvar_data"].get("uid")
+                if result["clinvar_data"].get("title") and "rs" in result["clinvar_data"]["title"]:
+                    # Try to extract rsid from ClinVar title
+                    import re
+                    match = re.search(r"\b(rs\d+)\b", result["clinvar_data"]["title"])
+                    if match:
+                        rep_rsid = match.group(1)
+                
+                if rep_rsid:
+                    result["myvariant_data"] = query_myvariant(rep_rsid)
+                    result["vep_data"] = query_vep(rep_rsid)
+                    
+            elif query_type == 'rsid':
                 # For rsID, query MyVariant and ClinVar
                 result["myvariant_data"] = query_myvariant(variant_id)
                 result["clinvar_data"] = query_clinvar(rsid=variant_id)

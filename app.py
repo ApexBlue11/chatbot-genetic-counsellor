@@ -15,7 +15,6 @@ from core.disease_correlation import correlate_diseases
 from analysis.vcf_parser import VCFParser
 from analysis.variant_analyser import VariantAnalyzer, VariantDataFetcher
 from analysis.pedigree_streamlit import display_pedigree_generator
-from rag.chatbot import RAGChatbot
 from ui import styling, layout
 
 # Configure Streamlit page FIRST (must be the first Streamlit command)
@@ -212,56 +211,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-@dataclass
-class QueryClassification:
-    is_genomic: bool
-    query_type: str
-    extracted_identifier: Optional[str]
-
-class GenomicQueryRouter:
-    def __init__(self):
-        self.hgvs_patterns = {
-            'transcript': [
-                r'\b(NM_\d+(?:\.\d+)?):c\.[A-Za-z0-9\-+*>_]+',
-                r'\b(ENST\d+(?:\.\d+)?):c\.[A-Za-z0-9\-+*>_]+',
-            ],
-            'genomic': [
-                r'\b(NC_\d+(?:\.\d+)?):g\.[A-Za-z0-9\-+*>_]+',
-                r'\b(chr(?:\d+|X|Y|MT?)):g\.\d+[A-Za-z]+>[A-Za-z]+',
-            ],
-            'protein': [
-                r'\b(NP_\d+(?:\.\d+)?):p\.[A-Za-z0-9\-+*>_()]+',
-                r'\b(ENSP\d+(?:\.\d+)?):p\.[A-Za-z0-9\-+*>_()]+',
-            ]
-        }
-        self.rsid_pattern = r'\b(rs\d+)\b'
-
-    def classify_query(self, query: str) -> QueryClassification:
-        query = query.strip()
-
-        for variant_type, patterns in self.hgvs_patterns.items():
-            for pattern in patterns:
-                match = re.search(pattern, query, re.IGNORECASE)
-                if match:
-                    return QueryClassification(
-                        is_genomic=True,
-                        query_type=f'hgvs_{variant_type}',
-                        extracted_identifier=match.group(0)
-                    )
-
-        rsid_match = re.search(self.rsid_pattern, query, re.IGNORECASE)
-        if rsid_match:
-            return QueryClassification(
-                is_genomic=True,
-                query_type='rsid',
-                extracted_identifier=rsid_match.group(1)
-            )
-
-        return QueryClassification(
-            is_genomic=False,
-            query_type='general',
-            extracted_identifier=None
-        )
+# GenomicQueryRouter is imported from core.query_router
 
 # ==================== GEMINI API ONLY ====================
 
@@ -1002,12 +952,30 @@ def render_tab2_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
+GENETICS_KEYWORDS = [
+    "variant", "mutation", "snp", "indel", "deletion", "insertion", "duplication",
+    "rs", "hgvs", "clingen", "clinvar", "dbsnp", "gene", "chromosome", "allele",
+    "genotype", "phenotype", "genome", "exon", "intron", "transcript", "protein",
+    "amino acid", "nucleotide", "codon", "pathogenic", "benign", "vus", "significance",
+    "inheritance", "hereditary", "carrier", "penetrance", "expressivity", "genetic counseling",
+    "brca", "cf", "sickle cell", "hemophilia", "huntington", "duchenne", "frequency",
+    "gnomad", "exac", "population", "consequence", "impact", "sift", "polyphen",
+    "cadd", "revel", "vep", "annotation"
+]
+
+def is_genetics_related(query: str) -> bool:
+    query_lower = query.lower()
+    keyword_match = any(keyword in query_lower for keyword in GENETICS_KEYWORDS)
+    hgvs_pattern = any(pattern in query_lower for pattern in ["nm_", "nc_", "ng_", "np_", "p.", "c.", "g."])
+    rsid_pattern = "rs" in query_lower and any(char.isdigit() for char in query)
+    return keyword_match or hgvs_pattern or rsid_pattern
+
 # --- Tab 1: Pedigree Generator ---
 with tab1:
     st.session_state.active_tab = 0
     display_pedigree_generator()
 
-# --- Tab 2: RAG AI Copilot ---
+# --- Tab 2: AI Copilot ---
 with tab2:
     st.session_state.active_tab = 1
     st.markdown('<div class="section-header">Ask the Assistant</div>', unsafe_allow_html=True)
@@ -1026,148 +994,67 @@ with tab2:
             st.warning("⚠️ `google-generativeai` package not installed. Install it with: `pip install google-generativeai`")
             st.session_state["gemini_client"] = None
 
-    if "rag_chatbot" not in st.session_state:
-        st.session_state["rag_chatbot"] = RAGChatbot()
-
     user_question = st.chat_input("Ask a variant or counseling question…")
     if user_question:
-        # Check if query is genetics-related (domain validation)
-        chatbot = st.session_state.get("rag_chatbot")
-        if chatbot and not chatbot.is_genetics_related(user_question):
+        if not is_genetics_related(user_question):
             with st.chat_message("assistant"):
                 st.warning(" **Out of Scope Query Detected**")
                 st.markdown("""
                 I'm specifically designed to assist genetic counselors with genetics and genomics-related questions.
                 
-                Your query doesn't appear to be related to:
-                - Genetic variants (HGVS notation, rsIDs, SNPs)
-                - Genes and chromosomes
-                - Clinical significance and disease associations
-                - Genetic counseling topics
-                
-                Please ask questions related to genetic variants, inheritance patterns, clinical genomics, 
-                or genetic counseling practices.
+                Your query doesn't appear to be related to genetics or counseling topics.
                 """)
             st.stop()
         
         # Classify the question
         classification = router.classify(user_question)
 
-        if not classification.is_genomic:
-            # General genetics question: direct Gemini response with rate limiting
-            genai = st.session_state.get("gemini_client")
-            if not genai:
-                with st.chat_message("assistant"):
-                    st.error("⚠️ **Gemini AI not available**")
-                    st.markdown("""
-                    The AI Copilot requires the `google-generativeai` package to be installed.
-                    
-                    **To fix this:**
-                    1. Install the package: `pip install google-generativeai`
-                    2. Set your `GEMINI_API_KEY` environment variable
-                    3. Restart the Streamlit app
-                    
-                    Alternatively, you can use the RAG chatbot for variant-specific questions.
-                    """)
-                st.stop()
+        genai = st.session_state.get("gemini_client")
+        if not genai:
+            with st.chat_message("assistant"):
+                st.error("⚠️ **Gemini AI not available**")
+            st.stop()
             
-            with st.spinner("Generating response…"):
-                try:
-                    model = genai.GenerativeModel('gemini-2.5-flash')
-                    response = model.generate_content(user_question)
-                    answer = response.text
-                except Exception as e:
-                    error_msg = str(e)
-                    if "429" in error_msg or "ResourceExhausted" in error_msg:
-                        st.error(" **Rate Limit Exceeded**")
-                        st.markdown("""
-                        The AI service is currently experiencing high demand. Please:
-                        1. Wait 30-60 seconds before trying again
-                        2. Try a more specific query to reduce processing time
-                        3. If the issue persists, check your API quota
+        with st.spinner("Generating response…"):
+            try:
+                system_prompt = (
+                    "You are a genomics-savvy assistant for genetic counselors. "
+                    "Use clinical evidence to answer questions clearly. "
+                    "Provide concise, professional guidance."
+                )
+                
+                extra_context = ""
+                if classification.is_genomic:
+                    clinvar_data = {}
+                    try:
+                        if classification.query_type == "rsid":
+                            clinvar_data = query_clinvar(rsid=classification.extracted_identifier)
+                        else:
+                            if not classification.extracted_identifier.startswith("NP_"):
+                                clingen_raw = query_clingen(classification.extracted_identifier)
+                                dbsnp_records = clingen_raw.get("externalRecords", {}).get("dbSNP", [])
+                                if dbsnp_records:
+                                    rsid = f"rs{dbsnp_records[0].get('rs')}"
+                                    clinvar_data = query_clinvar(rsid=rsid)
                         
-                        [Learn more about rate limits](https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429)
-                        """)
-                        st.stop()
-                    else:
-                        st.error(f"Error generating response: {error_msg}")
-                        st.stop()
+                        if clinvar_data and "error" not in clinvar_data:
+                            extra_context = f"\n\nLive variant context: {json.dumps(clinvar_data)}"
+                    except:
+                        pass
+                
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                full_prompt = f"{system_prompt}{extra_context}\n\nQuestion: {user_question}"
+                response = model.generate_content(full_prompt)
+                answer = response.text
+            except Exception as e:
+                answer = f"Error generating response: {str(e)}"
 
-            with st.chat_message("assistant"):
-                st.markdown(f'<div style="color: #1e293b !important;">{answer}</div>', unsafe_allow_html=True)
+        with st.chat_message("assistant"):
+            st.markdown(answer)
 
-        else:
-            # Variant-specific question: RAG + structured data
-            with st.spinner("Analyzing variant and consulting knowledge base…"):
-                # Get RAG response
-                answer, docs = st.session_state["rag_chatbot"].chat(user_question)
-
-                # Also fetch structured data (reuse single-variant logic)
-                clinvar_data = {}
-                try:
-                    if classification.query_type == "rsid":
-                        clinvar_data = query_clinvar(rsid=classification.extracted_identifier)
-                    else:
-                        # Try to get ClinVar via ClinGen
-                        if not classification.extracted_identifier.startswith("NP_"):
-                            clingen_raw = query_clingen(classification.extracted_identifier)
-                            dbsnp_records = clingen_raw.get("externalRecords", {}).get("dbSNP", [])
-                            if dbsnp_records:
-                                rsid = f"rs{dbsnp_records[0].get('rs')}"
-                                clinvar_data = query_clinvar(rsid=rsid)
-                except Exception as ex:
-                    pass
-
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-
-                # Show structured variant data if available (not raw JSON)
-                if clinvar_data and "error" not in clinvar_data and clinvar_data.get("clinical_significance"):
-                    st.markdown("---")
-                    st.markdown("###  Clinical Data Summary")
-                    
-                    # Color-coded significance badge
-                    sig = clinvar_data.get('clinical_significance', 'Unknown')
-                    if 'pathogenic' in sig.lower() and 'benign' not in sig.lower():
-                        badge_color = "#dc3545"
-                    elif 'benign' in sig.lower():
-                        badge_color = "#28a745"
-                    else:
-                        badge_color = "#ffc107"
-                    
-                    st.markdown(f"""
-                    <div style="border-left: 4px solid {badge_color}; padding: 15px; background-color: #f8f9fa; border-radius: 5px; margin-top: 10px; color: #2E3B4E;">
-                        <h4 style="margin:0; color:{badge_color};">{sig}</h4>
-                        <p style="color: #2E3B4E;"><strong>Gene:</strong> {clinvar_data.get('gene_symbol', 'Unknown')}</p>
-                        <p style="color: #2E3B4E;"><strong>Review Status:</strong> {clinvar_data.get('review_status', 'N/A')}</p>
-                        <p style="color: #2E3B4E;"><strong>Protein Change:</strong> {clinvar_data.get('protein_change', 'N/A')}</p>
-                        <p style="color: #2E3B4E;"><strong>Associated Conditions:</strong></p>
-                        <ul style="color: #2E3B4E;">
-                    """, unsafe_allow_html=True)
-                    
-                    conditions = clinvar_data.get('conditions', ['None reported'])
-                    for condition in conditions[:5]:  # Top 5 conditions
-                        st.markdown(f"<li style='color: #2E3B4E;'>{condition}</li>", unsafe_allow_html=True)
-                    
-                    st.markdown("</ul></div>", unsafe_allow_html=True)
-                    
-                    # Add references section
-                    st.markdown("###  References")
-                    st.markdown(f"- **ClinVar Record:** [View on NCBI](https://www.ncbi.nlm.nih.gov/clinvar/?term={classification.extracted_identifier})")
-                    if clinvar_data.get('gene_symbol'):
-                        st.markdown(f"- **Gene Info:** [View on NCBI Gene](https://www.ncbi.nlm.nih.gov/gene/?term={clinvar_data['gene_symbol']})")
-
-                # Show knowledge base evidence
-                with st.expander(" Retrieved Knowledge Base Evidence", expanded=False):
-                    st.markdown("*Sources from genetic counseling literature and guidelines:*")
-                    for idx, doc in enumerate(docs, 1):
-                        st.markdown(f"**{idx}. {doc['metadata'].get('source_id', 'Unknown Source')}** (Relevance: {doc['score']:.2%})")
-                        st.markdown(f"> {doc['content'][:400]}...")
-                        st.markdown("---")
-
-# --- Tab 2: Single Variant Analysis ---
-with tab2:
-    st.session_state.active_tab = 1
+# --- Tab 3: Single Variant Analysis ---
+with tab3:
+    st.session_state.active_tab = 2
     
     # Render sidebar for Tab 2
     render_tab2_sidebar()
@@ -1195,8 +1082,31 @@ with tab2:
                 try:
                     start_time = time.time()
                     
-                    # Handle RSID vs HGVS differently
-                    if classification.query_type == 'rsid':
+                    # Handle Gene Symbol, RSID vs HGVS differently
+                    if classification.query_type == 'gene_symbol':
+                        st.info(f" Gene Symbol detected: Querying ClinVar for '{classification.extracted_identifier}'")
+                        variant_data = variant_data_fetcher.fetch_variant_data(
+                            variant_id=classification.extracted_identifier,
+                            query_type='gene_symbol'
+                        )
+                        clingen_data = {
+                            'CAid': 'N/A (Gene input)',
+                            'rsid': 'N/A',
+                            'genomic_hgvs_grch38': 'N/A',
+                            'genomic_hgvs_grch37': 'N/A',
+                            'myvariant_hg38': 'N/A',
+                            'mane_ensembl': 'N/A',
+                            'mane_refseq': 'N/A'
+                        }
+                        annotations = {
+                            'myvariant_data': variant_data.get('myvariant_data'),
+                            'vep_data': variant_data.get('vep_data'),
+                            'errors': []
+                        }
+                        if not annotations['myvariant_data']:
+                            annotations['myvariant_data'] = {}
+                        annotations['myvariant_data']['clinvar'] = variant_data.get('clinvar_data', {})
+                    elif classification.query_type == 'rsid':
                         st.info(" RSID detected - querying MyVariant.info and Ensembl VEP directly")
                         clingen_data = {
                             'CAid': 'N/A (RSID input)', 
@@ -1287,15 +1197,21 @@ with tab2:
             st.write(f"**Type:** {classification.query_type}")
         st.markdown('</div>', unsafe_allow_html=True)
         
+        if classification.query_type == 'gene_symbol':
+            st.warning("⚠️ **Gene Search Detected**: ClinVar contains thousands of variants for this gene. Showing a representative variant record.")
+
         # ClinGen section
-        st.markdown('<div class="section-header"> ClinGen Allele Registry</div>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
+        st.markdown('<div class="section-header"> ClinGen Allele Registry & Known Aliases</div>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.write(f"**CAid:** {clingen_data.get('CAid', 'N/A')}")
             st.write(f"**RSID:** {clingen_data.get('rsid', 'N/A')}")
         with col2:
             st.write(f"**MANE Ensembl:** {clingen_data.get('mane_ensembl', 'N/A')}")
-            st.write(f"**MyVariant ID:** {clingen_data.get('myvariant_hg38', 'N/A')}")
+            st.write(f"**MANE RefSeq:** {clingen_data.get('mane_refseq', 'N/A')}")
+        with col3:
+            st.write(f"**GRCh38 Genomic:** {clingen_data.get('genomic_hgvs_grch38', 'N/A')}")
+            st.write(f"**GRCh37 Genomic:** {clingen_data.get('genomic_hgvs_grch37', 'N/A')}")
         
         # Show any errors
         if annotations.get('errors'):
@@ -1518,6 +1434,19 @@ with tab2:
                 )
         
         st.success(f" Analysis completed in {processing_time:.2f} seconds")
+
+        # Developer & API Query Logs
+        st.markdown("---")
+        with st.expander("🛠️ API Query Logs & Raw Response Payloads", expanded=False):
+            from core.api_clients import API_LOGS
+            if API_LOGS:
+                for idx, log in enumerate(API_LOGS, 1):
+                    st.markdown(f"**{idx}. [{log['timestamp']}] [{log['step']}]** {log['message']}")
+                    if log['raw_payload']:
+                        st.json(log['raw_payload'])
+                    st.markdown("---")
+            else:
+                st.info("No API query logs available for this session.")
     
     elif variant_input and not analyze_button:
         # Preview validation
@@ -1527,9 +1456,9 @@ with tab2:
         else:
             st.error(" Invalid format. Please provide a valid HGVS notation or RSID.")
 
-# --- Tab 3: VCF Batch Processing ---
-with tab3:
-    st.session_state.active_tab = 2
+# --- Tab 4: VCF Batch Processing ---
+with tab4:
+    st.session_state.active_tab = 3
     st.markdown('<div class="section-header"> VCF File Upload</div>', unsafe_allow_html=True)
     
     st.info(" **For Non-Technical Users**: Upload your VCF file to discover potential genetic disease associations. Patient identifying information will be automatically removed for privacy.")
@@ -1584,12 +1513,13 @@ with tab3:
                         if processed_count % 5 == 0:
                             st.write(f"✓ Processed {processed_count} variants... (Rate-limited to avoid API throttling)")
                         
-                        # Only process rsIDs for now (most reliable)
-                        if query_id.startswith('rs'):
+                        # Classify and query variant using query router
+                        classification = router.classify(query_id)
+                        if classification.is_genomic:
                             # Use VariantDataFetcher for comprehensive data
                             variant_data = variant_data_fetcher.fetch_variant_data(
-                                variant_id=query_id,
-                                query_type='rsid'
+                                variant_id=classification.extracted_identifier,
+                                query_type=classification.query_type
                             )
                             
                             clinvar_data = variant_data.get("clinvar_data", {})
