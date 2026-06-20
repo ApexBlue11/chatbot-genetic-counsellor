@@ -498,11 +498,20 @@ def get_variant_annotations(clingen_data, classification=None):
         
     return annotations
 
-def select_primary_vep_transcript(vep_data):
+def select_primary_vep_transcript(vep_data, target_transcript_id=None):
     """Select the primary transcript for VEP analysis based on priority."""
     if not vep_data or not vep_data[0].get('transcript_consequences'):
         return None, "No transcript consequences found"
     transcripts = vep_data[0]['transcript_consequences']
+    
+    # 1. Prioritize matching target transcript if provided (e.g. MANE select transcript from ClinGen)
+    if target_transcript_id:
+        clean_target = target_transcript_id.split('.')[0].split(':')[0].strip()
+        for t in transcripts:
+            if t.get('transcript_id', '').split('.')[0].strip() == clean_target:
+                return t, f"Matched target MANE transcript ({clean_target})"
+                
+    # 2. Prefer MANE Select from VEP's own flags
     for t in transcripts:
         flags = t.get('flags', [])
         if 'MANE_SELECT' in flags or any('mane' in str(flag).lower() for flag in flags):
@@ -518,14 +527,14 @@ def select_primary_vep_transcript(vep_data):
             return t, "First protein coding"
     return transcripts[0], "First available transcript"
 
-def display_vep_analysis(vep_data):
+def display_vep_analysis(vep_data, target_transcript_id=None):
     """Display comprehensive VEP analysis."""
     if not vep_data or not isinstance(vep_data, list) or not vep_data[0].get('transcript_consequences'):
         st.warning("No VEP data available")
         return
     variant_info = vep_data[0]
     all_transcripts = variant_info.get('transcript_consequences', [])
-    primary_transcript, selection_reason = select_primary_vep_transcript(vep_data)
+    primary_transcript, selection_reason = select_primary_vep_transcript(vep_data, target_transcript_id)
     if primary_transcript:
         st.subheader(f"Primary Transcript Analysis")
         col1, col2 = st.columns([2, 1])
@@ -603,11 +612,21 @@ def display_comprehensive_myvariant_data(myvariant_data):
         return
 
     if isinstance(myvariant_data, list):
-        if len(myvariant_data) > 1: st.info(f"Multiple variants found ({len(myvariant_data)}). Showing first result.")
-        if len(myvariant_data) > 0: myvariant_data = myvariant_data[0]
-        else:
-            st.warning("Empty response from MyVariant")
-            return
+        if len(myvariant_data) > 1: st.info(f"ℹ️ Multiple variant records returned from MyVariant ({len(myvariant_data)}). Selecting the record with the most complete annotation.")
+        best_record = myvariant_data[0]
+        best_score = -1
+        for r in myvariant_data:
+            if not isinstance(r, dict): continue
+            score = 0
+            if 'clinvar' in r: score += 10
+            if 'gnomad_genome' in r or 'gnomad_exome' in r: score += 5
+            if 'dbnsfp' in r: score += 3
+            if 'uniprot' in r: score += 2
+            score += len(r.keys()) * 0.1
+            if score > best_score:
+                best_score = score
+                best_record = r
+        myvariant_data = best_record
     if not isinstance(myvariant_data, dict):
         st.error("Unexpected data format from MyVariant")
         return
@@ -1132,12 +1151,17 @@ with tab3:
                             if search_resp.ok:
                                 urls = search_resp.json()
                                 if isinstance(urls, list) and urls:
-                                    allele_url = urls[0]
-                                    allele_resp = requests.get(allele_url, headers=headers, timeout=15)
-                                    if allele_resp.ok:
-                                        clingen_raw = allele_resp.json()
+                                    if isinstance(urls[0], dict):
+                                        clingen_raw = urls[0]
                                         clingen_data = parse_caid_minimal(clingen_raw)
                                         st.success(" ✅ Successfully resolved RSID aliases from ClinGen Allele Registry!")
+                                    else:
+                                        allele_url = urls[0]
+                                        allele_resp = requests.get(allele_url, headers=headers, timeout=15)
+                                        if allele_resp.ok:
+                                            clingen_raw = allele_resp.json()
+                                            clingen_data = parse_caid_minimal(clingen_raw)
+                                            st.success(" ✅ Successfully resolved RSID aliases from ClinGen Allele Registry!")
                         except Exception as e:
                             st.warning(f"Could not resolve RSID via ClinGen Allele Registry: {str(e)}")
 
@@ -1159,7 +1183,20 @@ with tab3:
                         if not annotations.get('vep_data') and annotations['myvariant_data']:
                             myv_data = annotations['myvariant_data']
                             if isinstance(myv_data, list) and len(myv_data) > 0:
-                                myv_data = myv_data[0]
+                                best_record = myv_data[0]
+                                best_score = -1
+                                for r in myv_data:
+                                    if not isinstance(r, dict): continue
+                                    score = 0
+                                    if 'clinvar' in r: score += 10
+                                    if 'gnomad_genome' in r or 'gnomad_exome' in r: score += 5
+                                    if 'dbnsfp' in r: score += 3
+                                    if 'uniprot' in r: score += 2
+                                    score += len(r.keys()) * 0.1
+                                    if score > best_score:
+                                        best_score = score
+                                        best_record = r
+                                myv_data = best_record
                                 annotations['myvariant_data'] = myv_data
                             
                             if isinstance(myv_data, dict):
@@ -1262,7 +1299,7 @@ with tab3:
             # Tab 1: VEP Analysis
             with result_tabs[0]:
                 if annotations.get('vep_data'): 
-                    display_vep_analysis(annotations['vep_data'])
+                    display_vep_analysis(annotations['vep_data'], clingen_data.get('mane_ensembl'))
                 else: 
                     st.info("No VEP data available for this variant.")
             

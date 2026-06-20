@@ -96,7 +96,20 @@ def query_myvariant(identifier: str) -> Dict[str, Any]:
         
         data = resp.json()
         if isinstance(data, list) and data:
-            data = data[0]
+            best_record = data[0]
+            best_score = -1
+            for r in data:
+                if not isinstance(r, dict): continue
+                score = 0
+                if 'clinvar' in r: score += 10
+                if 'gnomad_genome' in r or 'gnomad_exome' in r: score += 5
+                if 'dbnsfp' in r: score += 3
+                if 'uniprot' in r: score += 2
+                score += len(r.keys()) * 0.1
+                if score > best_score:
+                    best_score = score
+                    best_record = r
+            data = best_record
         return data
     
     try:
