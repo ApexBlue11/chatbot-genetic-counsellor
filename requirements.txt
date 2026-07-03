@@ -1,4 +1,6 @@
-streamlit
+fastapi
+uvicorn
+python-multipart
 pandas
 requests
 google-generativeai
