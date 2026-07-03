@@ -11,7 +11,13 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from PIL import Image, ImageDraw, ImageFont
 import io
-import streamlit as st
+import sys
+
+def log_pedigree_step(step_name: str, message: str, details: Any = None):
+    """Structured console logger for tracing pedigree inputs, processing, and rendering steps."""
+    timestamp = os.environ.get("CURRENT_TIME_STAMP", "LOG")
+    detail_str = f" | Details: {json.dumps(details)}" if details is not None else ""
+    print(f"[{timestamp}] [{step_name}] {message}{detail_str}", flush=True)
 
 
 @dataclass
@@ -237,6 +243,8 @@ class GeminiPedigreeParser:
     
     def parse_to_json(self, prompt: str) -> Dict[str, Any]:
         """Parse family description using Gemini AI"""
+        log_pedigree_step("PEDIGREE_INPUT", "Processing raw family description input", {"prompt": prompt})
+
         system_prompt = """You are a medical genetics expert. Convert the following family description into a strictly valid JSON object for pedigree tree generation.
 
 REQUIRED JSON STRUCTURE:
@@ -269,6 +277,23 @@ RULES:
 4) Create BOTH parent-child links for each parent to each child.
 5) Keep arrays present even if empty."""
 
+        # Attempt 1: Standard SDK integration using google-generativeai client
+        try:
+            log_pedigree_step("PEDIGREE_AI_REQUEST", "Attempting SDK-based generative model parsing", {"model": "gemini-2.5-flash"})
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(f"{system_prompt}\n\nFAMILY DESCRIPTION:\n{prompt}")
+            text = response.text
+            log_pedigree_step("PEDIGREE_AI_RESPONSE", "Received raw text from SDK client", {"text": text[:300]})
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                return self.validate_and_clean_json(parsed)
+        except Exception as sdk_err:
+            log_pedigree_step("PEDIGREE_SDK_WARNING", "SDK parsing failed or import error; falling back to direct endpoints", {"error": str(sdk_err)})
+
+        # Attempt 2: REST fallback endpoints
         body = {
             "contents": [{
                 "parts": [{"text": f"{system_prompt}\n\nFAMILY DESCRIPTION:\n{prompt}"}]
@@ -278,14 +303,15 @@ RULES:
         last_error = None
         for endpoint in self.endpoints:
             try:
+                log_pedigree_step("PEDIGREE_HTTP_REQUEST", f"POST query to direct REST endpoint", {"url": endpoint})
                 response = requests.post(
                     f"{endpoint}?key={self.api_key}",
                     headers={"Content-Type": "application/json"},
                     json=body,
-                    timeout=60
+                    timeout=45
                 )
                 if not response.ok:
-                    last_error = Exception(f"Gemini API error: {response.status_code}")
+                    last_error = Exception(f"Gemini API HTTP error: {response.status_code}")
                     continue
                 
                 data = response.json()
@@ -294,7 +320,7 @@ RULES:
                     parts = data["candidates"][0].get("content", {}).get("parts", [])
                     text = "".join([p.get("text", "") for p in parts])
                 
-                # Extract JSON from response
+                log_pedigree_step("PEDIGREE_AI_RESPONSE", "Received raw text from REST fallback", {"text": text[:300]})
                 json_match = re.search(r'\{[\s\S]*\}', text)
                 if not json_match:
                     last_error = Exception("No valid JSON found in response")
@@ -306,10 +332,12 @@ RULES:
             except Exception as e:
                 last_error = e
         
+        log_pedigree_step("PEDIGREE_AI_FATAL", "All pedigree parser execution routes exhausted", {"last_error": str(last_error)})
         raise last_error or Exception("Gemini API failed on all endpoints")
     
     def validate_and_clean_json(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and clean the JSON structure"""
+        log_pedigree_step("PEDIGREE_VALIDATE_START", "Starting data cleaning and schema validation")
         if "individuals" not in data or not isinstance(data["individuals"], list):
             raise ValueError("Invalid JSON: missing individuals array")
         
@@ -342,6 +370,10 @@ RULES:
             and rel.get("person2") in valid_ids
         ]
         
+        log_pedigree_step("PEDIGREE_VALIDATE_COMPLETE", "Schema validation succeeded", {
+            "total_individuals": len(data["individuals"]),
+            "total_relationships": len(data["relationships"])
+        })
         return data
 
 
@@ -597,13 +629,15 @@ class PedigreeGenerator:
                 # Organize generations
                 return self._organize_generations(json_data)
             except Exception as e:
-                st.warning(f"AI parsing failed, using simple parser: {str(e)}")
+                log_pedigree_step("PEDIGREE_PARSE_WARNING", "AI parsing failed; falling back to simple regex parser", {"error": str(e)})
         
         # Fallback to simple parser
+        log_pedigree_step("PEDIGREE_FALLBACK", "Using regex simple parser fallback")
         return self.simple_parser.parse(description)
     
     def _organize_generations(self, pedigree_data: Dict[str, Any]) -> Dict[str, Any]:
         """Organize individuals into proper generations"""
+        log_pedigree_step("PEDIGREE_ORGANIZE_START", "Organizing pedigree individuals into generations")
         individuals = pedigree_data["individuals"]
         relationships = pedigree_data.get("relationships", [])
         
@@ -670,6 +704,9 @@ class PedigreeGenerator:
             for gen, indivs in sorted(generations.items())
         ]
         
+        log_pedigree_step("PEDIGREE_ORGANIZE_COMPLETE", "Successfully sorted individuals into generations", {
+            "generations_count": len(pedigree_data["generations"])
+        })
         return pedigree_data
     
     def generate_image(self, pedigree_data: Dict[str, Any]) -> Image.Image:
