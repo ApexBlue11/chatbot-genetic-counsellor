@@ -37,75 +37,76 @@ class VariantDataFetcher:
         }
         
         try:
-            if query_type == 'gene_symbol':
-                # Query ClinVar directly for the gene symbol
-                result["clinvar_data"] = query_clinvar(gene_symbol=variant_id)
-                # Use the representative rsid of the matched variant to query other databases
-                rep_rsid = result["clinvar_data"].get("uid")
-                if result["clinvar_data"].get("title") and "rs" in result["clinvar_data"]["title"]:
-                    # Try to extract rsid from ClinVar title
-                    import re
-                    match = re.search(r"\b(rs\d+)\b", result["clinvar_data"]["title"])
-                    if match:
-                        rep_rsid = match.group(1)
-                
-                if rep_rsid:
-                    result["myvariant_data"] = query_myvariant(rep_rsid)
-                    result["vep_data"] = query_vep(rep_rsid)
-                    
-            elif query_type == 'rsid':
-                # For rsID, query MyVariant and ClinVar
-                result["myvariant_data"] = query_myvariant(variant_id)
-                result["clinvar_data"] = query_clinvar(rsid=variant_id)
-                result["vep_data"] = query_vep(variant_id) # Added missing VEP query for rsID
-            elif query_type == 'genomic_coordinates':
-                # Parse variant_id (e.g., "chr1:12345:A:G")
+            # Standardize genomic coordinates if provided
+            formatted_hgvs_g = None
+            if query_type == 'genomic_coordinates':
                 parts = variant_id.split(':')
                 if len(parts) == 4:
-                    chrom = parts[0]
-                    pos = parts[1]
-                    ref = parts[2]
-                    alt = parts[3]
-                    hgvs_genomic_id = f"{chrom}:g.{pos}{ref}>{alt}"
-
-                    # Now use this hgvs_genomic_id to query
-                    clingen_data = query_clingen(hgvs_genomic_id)
-                    result["clingen_data"] = clingen_data
-
-                    myvariant_id = clingen_data.get("externalRecords", {}).get("MyVariantInfo_hg38", [{}])[0].get("id")
-                    if myvariant_id:
-                        result["myvariant_data"] = query_myvariant(myvariant_id)
-
-                    rsid = None
-                    dbsnp_records = clingen_data.get("externalRecords", {}).get("dbSNP", [])
-                    if dbsnp_records:
-                        rsid = f"rs{dbsnp_records[0].get('rs')}"
-                        result["clinvar_data"] = query_clinvar(rsid=rsid)
-
-                    result["vep_data"] = query_vep(hgvs_genomic_id)
+                    chrom, pos, ref, alt = parts[0], parts[1], parts[2], parts[3]
+                    formatted_hgvs_g = f"{chrom}:g.{pos}{ref}>{alt}"
                 else:
                     raise ValueError("Invalid genomic coordinates format. Expected 'chr:pos:ref:alt'.")
-            else:
-                # For HGVS notation, query ClinGen first
-                clingen_data = query_clingen(variant_id)
-                result["clingen_data"] = clingen_data
-                
-                # Get MyVariant ID from ClinGen if available
-                myvariant_id = clingen_data.get("externalRecords", {}).get("MyVariantInfo_hg38", [{}])[0].get("id")
-                if myvariant_id:
-                    result["myvariant_data"] = query_myvariant(myvariant_id)
-                
-                # Get rsID for ClinVar query if available
-                rsid = None
-                dbsnp_records = clingen_data.get("externalRecords", {}).get("dbSNP", [])
-                if dbsnp_records:
-                    rsid = f"rs{dbsnp_records[0].get('rs')}"
-                    result["clinvar_data"] = query_clinvar(rsid=rsid)
-                
-                # Query VEP for variant effect prediction
-                if not query_type.startswith('hgvs_protein'):  # VEP doesn't work well with protein notation
+
+            # ── PHASE 1: Direct Queries for APIs that natively accept this input type ──
+            if query_type == 'rsid':
+                result["myvariant_data"] = query_myvariant(variant_id)
+                result["clinvar_data"] = query_clinvar(rsid=variant_id)
+                result["vep_data"] = query_vep(variant_id)
+            elif query_type == 'genomic_coordinates':
+                result["clingen_data"] = query_clingen(formatted_hgvs_g)
+                result["myvariant_data"] = query_myvariant(formatted_hgvs_g)
+                result["vep_data"] = query_vep(formatted_hgvs_g)
+            elif query_type == 'gene_symbol':
+                result["clinvar_data"] = query_clinvar(gene_symbol=variant_id)
+            else: # HGVS (transcript, genomic, protein)
+                result["clingen_data"] = query_clingen(variant_id)
+                result["myvariant_data"] = query_myvariant(variant_id)
+                if not query_type.startswith('hgvs_protein'):
                     result["vep_data"] = query_vep(variant_id)
-            
+
+            # ── PHASE 2: Multi-Source ID Resolution with OR Logic ──
+            extracted_rsid = None
+            if query_type == 'rsid':
+                extracted_rsid = variant_id
+            else:
+                # 1. Try ClinGen dbSNP
+                dbsnp_records = result["clingen_data"].get("externalRecords", {}).get("dbSNP", [])
+                if dbsnp_records and dbsnp_records[0].get('rs'):
+                    extracted_rsid = f"rs{dbsnp_records[0].get('rs')}"
+                # 2. OR try MyVariant dbSNP
+                elif result["myvariant_data"].get("dbsnp", {}).get("rsid"):
+                    mv_rs = result["myvariant_data"]["dbsnp"]["rsid"]
+                    extracted_rsid = mv_rs[0] if isinstance(mv_rs, list) else mv_rs
+                    if not str(extracted_rsid).startswith('rs'):
+                        extracted_rsid = f"rs{extracted_rsid}"
+                # 3. OR try VEP colocated variants
+                elif isinstance(result["vep_data"], list) and len(result["vep_data"]) > 0 and isinstance(result["vep_data"][0], dict):
+                    colocated = result["vep_data"][0].get("colocated_variants", [])
+                    for cv in colocated:
+                        if cv.get("id", "").startswith("rs"):
+                            extracted_rsid = cv["id"]
+                            break
+
+            # If ClinGen failed but MyVariant has a clingen.caid, rescue ClinGen data
+            caid = result["myvariant_data"].get("clingen", {}).get("caid")
+            if (not result["clingen_data"] or "error" in result["clingen_data"]) and caid:
+                clingen_rescued = query_clingen(caid)
+                if clingen_rescued and "error" not in clingen_rescued:
+                    result["clingen_data"] = clingen_rescued
+                    if not extracted_rsid:
+                        dbsnp_records = clingen_rescued.get("externalRecords", {}).get("dbSNP", [])
+                        if dbsnp_records and dbsnp_records[0].get('rs'):
+                            extracted_rsid = f"rs{dbsnp_records[0].get('rs')}"
+
+            # ── PHASE 3: Secondary Queries for unpopulated APIs using extracted IDs ──
+            # Fill ClinVar if missing and extracted_rsid is found
+            if not result["clinvar_data"] and extracted_rsid:
+                result["clinvar_data"] = query_clinvar(rsid=extracted_rsid)
+
+            # Fill VEP if missing and extracted_rsid is found
+            if not result["vep_data"] and extracted_rsid:
+                result["vep_data"] = query_vep(extracted_rsid)
+
             return result
         except Exception as e:
             return {"error": str(e)}
@@ -160,12 +161,37 @@ class VariantAnalyzer:
         evidence = []
         score = 0.5
         
-        # Check ClinVar data first (highest confidence)
-        if clinvar_data and "error" not in clinvar_data and clinvar_data.get("clinical_significance"):
+        # Check ClinVar from MyVariant first (highest specificity to variant)
+        mv_clinvar = myvariant_data.get('clinvar')
+        found_clinvar = False
+        
+        if mv_clinvar and 'rcv' in mv_clinvar:
+            rcvs = mv_clinvar['rcv']
+            if not isinstance(rcvs, list):
+                rcvs = [rcvs]
+                
+            # Try to find a pathogenic classification first
+            for rcv in rcvs:
+                if 'pathogenic' in str(rcv.get('clinical_significance', '')).lower():
+                    classification = "Pathogenic"
+                    break
+                    
+            if classification == "Variant of Uncertain Significance":
+                # Take the first one if no pathogenic found
+                classification = str(rcvs[0].get('clinical_significance', 'Uncertain'))
+                
+            confidence = "High (ClinVar)"
+            evidence.append("ClinVar database")
+            found_clinvar = True
+            
+        # Fallback to direct ClinVar E-utils data
+        elif clinvar_data and "error" not in clinvar_data and clinvar_data.get("clinical_significance"):
             classification = clinvar_data.get('clinical_significance', 'Uncertain')
             confidence = "High (ClinVar)"
             evidence.append("ClinVar database")
+            found_clinvar = True
             
+        if found_clinvar:
             # Map classification to score
             if "pathogenic" in classification.lower():
                 score = 0.9 if "likely" in classification.lower() else 1.0
@@ -174,7 +200,7 @@ class VariantAnalyzer:
             else:
                 score = 0.5
         
-        # Check functional predictions from MyVariant
+        # Check functional predictions from MyVariant if no ClinVar
         elif myvariant_data:
             pathogenic_criteria = 0
             benign_criteria = 0
@@ -213,7 +239,7 @@ class VariantAnalyzer:
                     benign_criteria += 1
             
             # Check VEP consequences
-            if vep_data and len(vep_data) > 0 and isinstance(vep_data[0], dict):
+            if isinstance(vep_data, list) and len(vep_data) > 0 and isinstance(vep_data[0], dict) and 'error' not in vep_data[0]:
                 transcript_consequences = vep_data[0].get('transcript_consequences', [])
                 if transcript_consequences:
                     # Find the most severe impact
@@ -265,7 +291,7 @@ class VariantAnalyzer:
             "evidence": evidence
         }
     
-    def _predict_functional_impact(self, myvariant_data: Dict[str, Any], vep_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _predict_functional_impact(self, myvariant_data: Dict[str, Any], vep_data: Any) -> Dict[str, Any]:
         """Predict the functional impact of a variant."""
         # Default values with specific missing data context
         protein_effect = "Unknown (no data available from VEP)"
@@ -274,7 +300,7 @@ class VariantAnalyzer:
         evolutionary_conservation = "Unknown (no conservation score available from MyVariant)"
         
         # Extract from VEP data
-        if vep_data and len(vep_data) > 0:
+        if isinstance(vep_data, list) and len(vep_data) > 0 and isinstance(vep_data[0], dict) and 'error' not in vep_data[0]:
             variant_info = vep_data[0]
             transcripts = variant_info.get('transcript_consequences', [])
             
@@ -396,32 +422,46 @@ class VariantAnalyzer:
             if 'clinvar' in myvariant_data:
                 clinvar = myvariant_data['clinvar']
                 
-                # Get conditions
+                # Get conditions safely
                 if clinvar.get('rcv'):
-                    for rcv in clinvar['rcv']:
-                        if rcv.get('conditions'):
-                            if isinstance(rcv['conditions'], list):
-                                associated_conditions.extend(rcv['conditions'])
-                            else:
-                                associated_conditions.append(rcv['conditions'])
+                    rcv_list = clinvar['rcv'] if isinstance(clinvar['rcv'], list) else [clinvar['rcv']]
+                    for rcv in rcv_list:
+                        if isinstance(rcv, dict) and rcv.get('conditions'):
+                            cond = rcv['conditions']
+                            if isinstance(cond, dict):
+                                name = cond.get('name') or cond.get('synonyms')
+                                if name: associated_conditions.append(name if isinstance(name, str) else str(name))
+                            elif isinstance(cond, list):
+                                for c in cond:
+                                    if isinstance(c, dict) and c.get('name'):
+                                        associated_conditions.append(str(c['name']))
+                                    elif isinstance(c, str):
+                                        associated_conditions.append(c)
+                            elif isinstance(cond, str):
+                                associated_conditions.append(cond)
                 
                 # Get clinical significance
                 if clinvar.get('clinical_significance'):
                     clinical_significance = clinvar['clinical_significance']
                     
                     # Determine actionability based on clinical significance
-                    if "pathogenic" in clinical_significance.lower():
+                    if "pathogenic" in str(clinical_significance).lower():
                         actionability = "High"
                         guidelines = "Recommend genetic counseling and clinical management"
-                    elif "benign" in clinical_significance.lower():
+                    elif "benign" in str(clinical_significance).lower():
                         actionability = "Low"
                         guidelines = "No specific clinical action indicated"
                     else:
                         actionability = "Medium"
                         guidelines = "Consider genetic counseling for further evaluation"
         
-        # Remove duplicates from conditions
-        associated_conditions = list(set(associated_conditions))
+        # Remove duplicates safely
+        clean_conditions = []
+        for cond in associated_conditions:
+            cond_str = str(cond['name']) if isinstance(cond, dict) and 'name' in cond else str(cond)
+            if cond_str not in clean_conditions:
+                clean_conditions.append(cond_str)
+        associated_conditions = clean_conditions
         
         return {
             "associated_conditions": associated_conditions,

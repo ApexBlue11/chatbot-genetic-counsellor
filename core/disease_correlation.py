@@ -26,7 +26,7 @@ def correlate_diseases(myvariant_data: Dict[str, Any], vep_data: List[Dict[str, 
 
     gene_symbol = None
     # Try to get gene symbol from VEP data
-    if vep_data and len(vep_data) > 0:
+    if isinstance(vep_data, list) and len(vep_data) > 0 and isinstance(vep_data[0], dict) and 'error' not in vep_data[0]:
         transcript_consequences = vep_data[0].get('transcript_consequences', [])
         if transcript_consequences:
             for transcript in transcript_consequences:
@@ -39,7 +39,13 @@ def correlate_diseases(myvariant_data: Dict[str, Any], vep_data: List[Dict[str, 
         gene_symbol = clingen_data["gene"].get("symbol")
 
     if clinvar.get("rcv"):
-        for record in clinvar["rcv"]:
+        rcvs = clinvar["rcv"]
+        if not isinstance(rcvs, list):
+            rcvs = [rcvs]
+            
+        for record in rcvs:
+            if not isinstance(record, dict):
+                continue
             cond = record.get("conditions", {})
             name = cond.get("name") if isinstance(cond, dict) else None
             significance = record.get("clinical_significance", "Not provided")

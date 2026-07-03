@@ -3,6 +3,8 @@
 Test script to verify the integration of VariantAnalyzer and VariantDataFetcher
 """
 
+import sys
+sys.path.append('.')
 from analysis.variant_analyser import VariantAnalyzer, VariantDataFetcher
 from core.query_router import GenomicQueryRouter
 

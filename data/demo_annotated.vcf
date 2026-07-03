@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##fileDate=20260626
+##source=GeneticCounsellingWorkbenchDemo
+##reference=GRCh38
+##INFO=<ID=CLNSIG,Number=1,Type=String,Description="Clinical Significance from ClinVar">
+##INFO=<ID=GENE,Number=1,Type=String,Description="Associated Gene">
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele Frequency">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+7	117559590	rs113993960	A	G	100	PASS	GENE=CFTR;CLNSIG=Pathogenic;AF=0.00002
+17	43044295	rs28897696	A	G	100	PASS	GENE=BRCA1;CLNSIG=Pathogenic;AF=0.00001
+13	32936732	rs80359507	C	T	100	PASS	GENE=BRCA2;CLNSIG=Benign;AF=0.024
+2	179390502	rs121909001	T	C	100	PASS	GENE=TTN;CLNSIG=Uncertain_Significance;AF=0.001

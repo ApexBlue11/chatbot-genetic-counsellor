@@ -54,3 +54,18 @@ data/knowledge_base/*.sqlite3
 FIXES_APPLIED.md
 TESTING_GUIDE.md
 commit_script.sh
+
+# Project Specific Ignored Folders
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+api_key/
+scratch/
+tests/logs/
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!theme.json
+!manifest.json

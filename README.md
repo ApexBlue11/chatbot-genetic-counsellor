@@ -1,292 +1,141 @@
-# Genetic Counselling Workbench
+# VariantMind: Intelligent Variant Curation & Pedigree Workbench
 
-**Live Demo**: [https://genetic-workbench.streamlit.app](https://genetic-workbench.streamlit.app)
+VariantMind is a production-grade web application for genetic counselors, clinical geneticists, and researchers. It features AI-assisted variant interpretation, batch VCF processing with differential prompting context, multi-patient session management, and pedigree chart generation.
 
-A production-grade web application for genetic counselors featuring AI-powered variant analysis, batch VCF processing, and an intelligent RAG (Retrieval-Augmented Generation) assistant. Built with Python, Streamlit, and integrated with 5 major genomics APIs.
-
----
-
-## Architecture Overview
-
-```
-chatbot-gc-main/
-├── app.py                      # Main Streamlit application (1738 lines)
-├── core/                       # Core business logic
-│   ├── query_router.py        # Intelligent query classification (HGVS/rsID/gene)
-│   ├── api_clients.py         # External API integrations
-│   └── disease_correlation.py # Disease-gene association logic
-├── analysis/                   # Variant analysis pipeline
-│   ├── vcf_parser.py          # VCF/VCF.gz file parser
-│   ├── variant_analyser.py    # Single variant analysis orchestration
-│   └── variant_analysis.py    # Batch variant processing
-├── rag/                        # RAG chatbot system
-│   ├── chatbot.py             # RAG implementation with domain validation
-│   ├── ingest.py              # Document ingestion pipeline
-│   ├── vectorstore.py         # ChromaDB vector database interface
-│   └── documents.yaml         # Knowledge base source URLs
-├── ui/                         # UI components
-│   ├── components.py          # Reusable UI widgets
-│   ├── layout.py              # Page layout structure
-│   └── styling.py             # CSS styling injection
-└── data/knowledge_base/        # ChromaDB persistent storage
-```
+The application is structured as a **FastAPI backend** and a modern **React (Vite) frontend**.
 
 ---
 
-## Core Modules
-
-### 1. **Query Router** (`core/query_router.py`)
-- **Purpose**: Classifies user input into query types
-- **Flow**:
-  1. Accepts raw text input (e.g., "NM_000277.2:c.1521_1523del", "rs429358")
-  2. Uses regex patterns to detect:
-     - **HGVS notation**: `NM_`, `NC_`, `ENST`, with position/change syntax
-     - **rsID**: `rs` followed by digits
-     - **Gene symbols**: Alphanumeric gene names
-  3. Returns query type + normalized format
-- **Output**: `{"type": "hgvs", "query": "NM_000277.2:c.1521_1523del"}`
-
-### 2. **API Clients** (`core/api_clients.py`)
-Implements REST API integrations with error handling and retry logic:
-
-#### **ClinGen Allele Registry**
-- Endpoint: `https://reg.clinicalgenome.org/allele`
-- Input: HGVS variant (e.g., `NM_000277.2:c.1521_1523del`)
-- Returns: Canonical allele ID, molecular consequence, gene context
-
-#### **MyVariant.info**
-- Endpoint: `https://myvariant.info/v1/variant/{hgvs}`
-- Input: HGVS or rsID
-- Returns: ClinVar data (clinical significance, review status), dbSNP info, CADD scores
-
-#### **Ensembl VEP (Variant Effect Predictor)**
-- Endpoint: `https://rest.ensembl.org/vep/human/hgvs/{variant}`
-- Input: HGVS notation
-- Returns: Transcript consequences, SIFT/PolyPhen predictions, protein impact
-
-#### **ClinVar**
-- Endpoint: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi`
-- Input: Variant query
-- Returns: ClinVar variation ID, clinical significance, condition associations
-
-**Error Handling**: All clients implement:
-- Rate limit detection (429 errors)
-- Retry with exponential backoff
-- URL encoding for special characters (e.g., `>`, `*`, parentheses)
-
-### 3. **Variant Analyzer** (`analysis/variant_analyser.py`)
-
-#### **VariantDataFetcher**
-Orchestrates parallel API calls:
-```python
-fetch_variant_data(hgvs_id):
-    ├── query_clingen(hgvs_id)      # Canonical allele
-    ├── query_myvariant(hgvs_id)    # Population frequency
-    ├── query_vep(hgvs_id)          # Functional prediction
-    └── query_clinvar(hgvs_id)      # Clinical significance
-    
-    Returns consolidated JSON with all data sources
-```
-
-#### **VariantAnalyzer**
-- Processes single variants through full pipeline
-- Formats data for Streamlit display (DataFrames, styled cards)
-- Handles missing data gracefully (shows "N/A" for unavailable fields)
-
-### 4. **VCF Parser** (`analysis/vcf_parser.py`)
-- **Input**: `.vcf` or `.vcf.gz` files
-- **Processing**:
-  1. Detects file compression (gzip handling)
-  2. Skips header lines (`##`)
-  3. Parses tab-delimited variant records
-  4. Extracts: CHROM, POS, ID (rsID), REF, ALT, QUAL, FILTER, INFO, FORMAT
-- **Output**: Pandas DataFrame with structured variant data
-- **Privacy**: Strips patient-identifying columns (sample names)
-
-### 5. **RAG Chatbot** (`rag/chatbot.py`)
-
-#### **Architecture**:
-```
-User Query
-    ↓
-Domain Validation (genetics keywords only)
-    ↓
-Vector Search (ChromaDB)
-    ↓
-Retrieve Top-K Documents (K=5)
-    ↓
-Context Building (concatenate retrieved docs)
-    ↓
-Google Gemini API (with context + query)
-    ↓
-Response
-```
-
-#### **Domain Validation**:
-```python
-is_genetics_related(query):
-    Keywords = ["variant", "gene", "mutation", "HGVS", "genetic", 
-                "chromosome", "allele", "genotype", "inheritance", ...]
-    
-    if any(keyword in query.lower()):
-        return True
-    else:
-        return False  # Reject non-genetics queries
-```
-
-#### **Vector Store** (`rag/vectorstore.py`):
-- **Database**: ChromaDB with persistent storage (`data/knowledge_base/`)
-- **Embeddings**: Sentence-Transformers (`all-MiniLM-L6-v2`)
-- **Indexing**:
-  1. Scrapes genetic counseling articles from `documents.yaml`
-  2. Chunks documents into 512-token segments
-  3. Generates embeddings
-  4. Stores in ChromaDB with metadata (source URL, chunk ID)
-- **Retrieval**: Cosine similarity search on query embeddings
-
----
-
-## Application Flow
-
-### **Tab 1: AI Copilot**
-```
-User Input
-    ↓
-Domain Validation Check
-    ↓ (Pass)
-RAG Chatbot Query
-    ↓
-Vector Search (5 documents)
-    ↓
-Gemini API Call (with context)
-    ↓
-Display Response (chat bubbles with gradient styling)
-```
-
-**Features**:
-- Chat history persistence (session state)
-- Automatic context building from past messages
-- Rate limit handling (shows retry message)
-- Domain restriction (only genetics queries accepted)
-
-### **Tab 2: Single Variant Analysis**
-```
-User Input (HGVS or rsID)
-    ↓
-Query Router Classification
-    ↓
-Parallel API Calls:
-    ├── ClinGen (gene context)
-    ├── MyVariant (population data)
-    ├── VEP (functional prediction)
-    └── ClinVar (clinical significance)
-    ↓
-Data Consolidation
-    ↓
-Display Results:
-    ├── Clinical Significance Card (color-coded)
-    ├── Gene Information Table
-    ├── Population Frequency Chart
-    ├── Functional Predictions Table
-    └── External Links (ClinVar, gnomAD, UCSC)
-```
-
-**Sidebar Settings**:
-- Display format examples (HGVS, rsID, gene)
-- Frequency threshold slider (filters variants by MAF)
-- Collapsible by default, only visible in Tab 2
-
-### **Tab 3: VCF Batch Processing**
-```
-File Upload (.vcf / .vcf.gz / .txt / .doc / .docx / .pdf)
-    ↓
-VCF Parser (extracts variants)
-    ↓
-Patient De-identification (strips sample columns)
-    ↓
-Batch Processing Loop:
-    For each variant:
-        ├── Convert to HGVS (if rsID)
-        ├── Query APIs (same as Tab 2)
-        └── Append to results DataFrame
-    ↓
-Display Summary Table (sortable, filterable)
-    ↓
-Download as CSV (de-identified)
-```
-
-**Privacy Features**:
-- Removes patient names from filenames (e.g., `JohnDoe.vcf` → `uploaded_variants.vcf`)
-- Strips FORMAT and sample genotype columns
-- Only retains: CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO
-
----
-
-## Data Flow Diagram
+## 🏛️ Architecture Overview
 
 ```
-┌─────────────────┐
-│   User Input    │
-└────────┬────────┘
-         │
-    ┌────▼────┐
-    │ Router  │ (Query Classification)
-    └────┬────┘
-         │
-    ┌────▼─────────────────────────┐
-    │  Parallel API Orchestration  │
-    └────┬─────────────────────────┘
-         │
-    ┌────▼────┐  ┌────▼────┐  ┌────▼────┐  ┌────▼────┐
-    │ ClinGen │  │MyVariant│  │   VEP   │  │ ClinVar │
-    └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘
-         │            │            │            │
-         └────────────┴─────┬──────┴────────────┘
-                            │
-                     ┌──────▼──────┐
-                     │ Consolidate │
-                     └──────┬──────┘
-                            │
-                     ┌──────▼──────┐
-                     │  Display UI │
-                     └─────────────┘
+chatbot-genetic-counsellor/
+├── api/                       # FastAPI Backend
+│   ├── routers/
+│   │   ├── chat.py           # Differential context mode, AI conversation & tools router
+│   │   ├── conversations.py  # Conversation history management
+│   │   └── upload.py         # Multi-patient VCF upload router (max 3 files, 25/file cap)
+│   └── main.py                # Backend application entry point
+├── frontend/                  # React Frontend (Vite + Vanilla CSS)
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── ChatArea.jsx          # Live Chat UI, patient labels, context trigger
+│   │   │   ├── MessageBubble.jsx     # Markdown rendering, expandable details tabs
+│   │   │   ├── Sidebar.jsx           # Conversation management & search
+│   │   │   ├── VariantDetailsTabs.jsx # Predictors, frequencies & submissions tabs
+│   │   │   └── VcfVariantTable.jsx   # 5-per-page paginated variant viewer with search
+│   │   ├── services/
+│   │   │   └── api.js                # API client integration
+│   │   ├── App.jsx                   # Main layout container
+│   │   └── index.css                 # Color palettes, custom typography & CSS variables
+├── core/                      # Core Genomics Logic
+│   ├── api_clients.py         # MyVariant.info, VEP, ClinVar, PubMed, and ClinGen integrations
+│   ├── gemini_client.py       # Google Gemini agent configuration & 5 tool schemas
+│   ├── history_db.py          # SQLite database wrapper for persistent chat & VCF tracking
+│   └── query_router.py        # Regex classifier for HGVS, rsID, and genes
+├── analysis/                  # Variant Processing & Prioritization
+│   ├── vcf_parser.py          # Robust VCF parser (QUAL checks & chr prefix stripping)
+│   ├── vcf_prioritizer.py     # Variant prioritizer, gene cluster analyser, and data enricher
+│   └── variant_analyser.py    # Single variant analysis orchestrator
+├── tests/                     # Developer Testing Suite
+│   ├── test_integration_v2.py # Comprehensive 38-check integration & scenario suite
+│   ├── test_qa_full.py        # 26-check unit & regression test suite
+│   └── test_all_input_types.py# Regex query router tests
+└── data/                      # Demo Clinical Datasets
+    ├── demo_500_variants.vcf  # Large VCF for batching limits validation
+    ├── demo_annotated.vcf     # Annotated VCF featuring CFTR, HBB, and BRCA1 variants
+    └── demo_unannotated.vcf   # Unannotated VCF for coordinates pipeline testing
 ```
 
 ---
 
-## Features
+## 🛠️ Installation & Setup
 
-- **AI Copilot**: RAG-powered chatbot with domain validation for genetics queries only
-- **Single Variant Analysis**: HGVS/rsID analysis with ClinGen, MyVariant, VEP, ClinVar integration
-- **VCF Batch Processing**: Upload and analyze VCF files (.vcf, .vcf.gz) with automatic patient de-identification
+### Prerequisites
+* Python 3.9+
+* Node.js 18+
+* Google Gemini API Key
 
+### Backend Setup
+1. From the project root, install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Set your Gemini API key in your terminal session or environment variables:
+   * **Windows (PowerShell)**:
+     ```powershell
+     $env:GEMINI_API_KEY="your-api-key-here"
+     ```
+   * **Linux/macOS**:
+     ```bash
+     export GEMINI_API_KEY="your-api-key-here"
+     ```
+3. Run the backend development server (listens on port 8000):
+   ```bash
+   uvicorn api.main:app --port 8000 --reload
+   ```
 
-## Technology Stack
-
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| **Frontend** | Streamlit 1.28+ | Interactive web UI with custom CSS |
-| **AI Model** | Google Gemini API | LLM for RAG responses |
-| **Vector DB** | ChromaDB 0.4.18 | Semantic search for knowledge base |
-| **Embeddings** | Sentence-Transformers | Document vectorization |
-| **APIs** | ClinGen, MyVariant, VEP, ClinVar | Genomic data sources |
-| **File Parsing** | Pandas, gzip | VCF file processing |
-| **Deployment** | Streamlit Cloud | Production hosting |
-| **Python** | 3.8+ | Core language |
-
-
-
-
-## License
-
-See [LICENSE](LICENSE) file.
+### Frontend Setup
+1. Navigate to the `frontend/` directory:
+   ```bash
+   cd frontend
+   ```
+2. Install Node packages:
+   ```bash
+   npm install
+   ```
+3. Start the Vite local server:
+   ```bash
+   npm run dev
+   ```
+4. Access the web app in your browser at `http://localhost:5173/`.
 
 ---
 
-**Research & Educational Use Only** • Patient Data De-identified
+## 🔬 Core Systems
 
+### 1. Differential Prompting Context Modes
+To maintain high responsiveness and stay within strict model token efficiency, VariantMind dynamically adjusts context details based on variant count:
+* **Deep Context Mode (≤ 35 variants across all files)**: The LLM prompt is injected with full annotated records including SIFT, PolyPhen, CADD, REVEL, 8 population frequency ancestries, and ClinVar submissions.
+* **Basic Context Mode (> 35 variants)**: The prompt is injected with a compact Markdown table. The LLM uses `read_enriched_data` proactively to retrieve full annotations on-demand.
+
+### 2. Multi-Patient Session uploads (Max 3 files)
+- Enables trio analysis (Proband + Sibling + Mother).
+- Up to 3 VCFs can be uploaded simultaneously under the same conversation ID.
+- Each VCF is capped at `PER_FILE_CAP = 25` variants for processing efficiency.
+- A 4th upload attempt is automatically rejected with a clean `HTTP 409 Conflict`.
+
+### 3. Integrated AI Agent Tools (5 tools)
+VariantMind's LLM agent is equipped with five tools to gather live literature and drill into local variant files:
+1. `read_patient_vcf`: Read raw coordinate segments from uploaded VCF files.
+2. `read_enriched_data`: Read cached annotator data (predictors, frequencies) instantly.
+3. `Clinical_Variant_Analyzer`: Fetch live details from MyVariant, VEP, and ClinVar for novel variants.
+4. `search_pubmed`: Perform targeted search queries for literature.
+5. `create_pedigree_chart`: Generate pedigree metadata to render family histories.
 
 ---
 
-<div align="center">
- 
+## 🧪 Running Developer Test Suites
+
+VariantMind has two developer test suites to prevent regressions and verify API contracts:
+
+### 1. Unit & Regression Tests (`test_qa_full.py`)
+Runs 26 checks validating individual modules like VCF parsers, API endpoints, dbNSFP parsing, VEP batch chunking, and SQLite history tracking.
+```bash
+$env:PYTHONPATH="."
+python tests/test_qa_full.py
+```
+
+### 2. End-to-End & Integration Tests (`test_integration_v2.py`)
+Runs 38 checks testing frontend-backend contracts, patient isolation, pedigree triggers, and simulated clinical scenarios:
+* **Scenario A (Family Trio)**: Simulates uploading Proband, Sibling, and Mother files, verifying that the AI isolates patients and maps variant classifications correctly.
+* **Scenario B (Researcher Search)**: Verifies variant routing triggers without context leaks.
+* **Scenario C (Pedigree Session)**: Verifies automated pedigree generation from family descriptors.
+```bash
+$env:PYTHONPATH="."
+python tests/test_integration_v2.py
+```
+
+---
+
+*For Research and Educational Use Only. Ensure all clinical decisions are confirmed by a board-certified professional.*

@@ -39,16 +39,49 @@ class VCFParser:
         fields = line.split("\t")
         data = dict(zip(header, fields))
         info = self._parse_info(data.get("INFO", ""))
+
+        # Extract ClinVar significance and allele frequency from VCF INFO field
+        clnsig = info.get("CLNSIG", None)
+        af_val = info.get("AF", info.get("GMAF", info.get("ExAC_AF", None)))
+
+        try:
+            af = float(af_val) if af_val is not None else None
+        except (ValueError, TypeError):
+            af = None
+
+        qual_raw = data.get("QUAL", ".")
+        try:
+            qual = None if qual_raw in (".", "", None) else float(qual_raw)
+        except (ValueError, TypeError):
+            qual = None
+
+        # Normalise chromosome: strip 'chr' prefix for consistency
+        chrom_raw = data.get("CHROM", "")
+        chrom = chrom_raw[3:] if chrom_raw.lower().startswith("chr") else chrom_raw
+
+        try:
+            pos = int(data.get("POS", 0))
+        except (ValueError, TypeError):
+            pos = 0
+
+        rec_id = data.get("ID", ".")
+        rec_id = None if rec_id == "." else rec_id
+
+        query_id = self._choose_query_id_safe(rec_id, chrom, pos,
+                                              data.get("REF", ""), data.get("ALT", ""))
         return {
-            "chrom": data["CHROM"],
-            "pos": int(data["POS"]),
-            "id": None if data["ID"] == "." else data["ID"],
-            "ref": data["REF"],
-            "alt": data["ALT"],
-            "qual": None if data["QUAL"] == "." else float(data["QUAL"]),
-            "filter": data["FILTER"],
+            "chrom": chrom,
+            "pos": pos,
+            "id": rec_id,
+            "ref": data.get("REF", ""),
+            "alt": data.get("ALT", ""),
+            "qual": qual,
+            "filter": data.get("FILTER", "."),
             "info": info,
-            "query_id": self._choose_query_id(data, info),
+            "clnsig": clnsig,
+            "af": af,
+            "query_id": query_id,
+            "variant_id": query_id,   # alias used by read_patient_vcf tool
         }
 
     def _parse_info(self, info_field: str):
@@ -63,11 +96,20 @@ class VCFParser:
                 info[part] = True
         return info
 
+    def _choose_query_id_safe(self, rec_id, chrom, pos, ref, alt) -> str:
+        if rec_id and rec_id.lower().startswith("rs"):
+            return rec_id
+        return f"chr{chrom}:g.{pos}{ref}>{alt}"
+
+    # Legacy alias kept for compatibility
     def _choose_query_id(self, record: Dict[str, Any], info: Dict[str, Any]):
         record_id = record.get("ID")
         if record_id and record_id.startswith("rs"):
             return record_id
-        return f"chr{record['CHROM']}:g.{record['POS']}{record['REF']}>{record['ALT']}"
+        chrom = record.get('CHROM', '')
+        if chrom.lower().startswith('chr'):
+            chrom = chrom[3:]
+        return f"chr{chrom}:g.{record.get('POS','0')}{record.get('REF','')}>{record.get('ALT','')}"
 
     def to_dataframe(self, variants: Optional[List[Dict[str, Any]]] = None):
         variants = variants or self.variants
@@ -84,8 +126,11 @@ class VCFParser:
                     "Alternate": var["alt"],
                     "Quality": var["qual"] if var["qual"] is not None else None,
                     "Filter": var["filter"],
-                    "Gene": var["info"].get("GENE") or var["info"].get("GENEINFO", "N/A"),
+                    "Gene": var["info"].get("GENE") or var["info"].get("GENEINFO", "").split(":")[0] if var["info"].get("GENEINFO") else var["info"].get("GENE", "N/A"),
+                    "ClinVar Sig": var["clnsig"] or "N/A",
+                    "Allele Freq": f"{var['af']:.5f}" if var["af"] is not None else "N/A",
                     "Query ID": var["query_id"],
                 }
             )
         return pd.DataFrame(rows)
+

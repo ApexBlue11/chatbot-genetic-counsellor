@@ -1,4 +1,6 @@
 import json
+import sys
+sys.path.append('.')
 from analysis.vcf_parser import VCFParser
 from analysis.variant_analyser import VariantDataFetcher, VariantAnalyzer
 

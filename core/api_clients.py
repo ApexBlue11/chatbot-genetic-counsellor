@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 
 CLINGEN_BASE = "https://reg.clinicalgenome.org/allele"
-MYVARIANT_BASE = "https://myvariant.info/v1/variant"
+MYVARIANT_BASE = "https://myvariant.info/v1"
 VEP_BASE = "https://rest.ensembl.org/vep/human/hgvs"
 CLINVAR_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
@@ -86,16 +86,36 @@ def query_myvariant(identifier: str) -> Dict[str, Any]:
     log_api_step("MYVARIANT_QUERY", f"Querying MyVariant.info for: '{identifier}'")
     
     def _query():
-        url = f"{MYVARIANT_BASE}/{identifier}"
-        params = {"assembly": "hg38"}
+        if identifier.startswith('rs') or not identifier.startswith('chr'):
+            url = f"{MYVARIANT_BASE}/query"
+            params = {"q": identifier, "fields": "all"}
+        else:
+            url = f"{MYVARIANT_BASE}/variant/{identifier}"
+            params = {"assembly": "hg38"}
+            
         log_api_step("MYVARIANT_HTTP_REQUEST", f"GET Request to: {url} with params {params}")
         
         resp = requests.get(url, params=params, timeout=30)
         log_api_step("MYVARIANT_HTTP_RESPONSE", f"HTTP Status: {resp.status_code}")
-        resp.raise_for_status()
         
+        # If variant endpoint gave 404, fallback to query endpoint
+        if resp.status_code == 404 and "/variant/" in url:
+            fallback_url = f"{MYVARIANT_BASE}/query"
+            fallback_params = {"q": identifier, "fields": "all"}
+            log_api_step("MYVARIANT_HTTP_REQUEST", f"Fallback GET Request to: {fallback_url} with params {fallback_params}")
+            resp = requests.get(fallback_url, params=fallback_params, timeout=30)
+            log_api_step("MYVARIANT_HTTP_RESPONSE", f"Fallback HTTP Status: {resp.status_code}")
+            
+        resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list) and data:
+        
+        # If it was a query, it returns { "hits": [...] }
+        if isinstance(data, dict) and "hits" in data:
+            data = data["hits"]
+            
+        if isinstance(data, list):
+            if not data:
+                return {}  # No hits — return empty dict (not list)
             best_record = data[0]
             best_score = -1
             for r in data:
@@ -109,7 +129,10 @@ def query_myvariant(identifier: str) -> Dict[str, Any]:
                 if score > best_score:
                     best_score = score
                     best_record = r
-            data = best_record
+            data = best_record if isinstance(best_record, dict) else {}
+        # Ensure we always return a dict
+        if not isinstance(data, dict):
+            return {}
         return data
     
     try:
@@ -127,14 +150,21 @@ def query_vep(hgvs: str) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     try:
-        if hgvs.startswith('rs'):
-            url = f"https://rest.ensembl.org/vep/human/id/{quote(hgvs, safe='')}"
-        elif hgvs.startswith('NP_'):
+        import re
+        # If HGVS transcript has a version number (e.g. NM_000492.3:c...), strip version for VEP compatibility
+        clean_hgvs = re.sub(r'(N[MCGP]_\d+)\.\d+:', r'\1:', hgvs)
+        
+        if clean_hgvs.startswith('rs'):
+            url = f"https://rest.ensembl.org/vep/human/id/{quote(clean_hgvs, safe='')}"
+        elif clean_hgvs.startswith('NP_'):
             err_msg = "VEP does not support protein-level HGVS notation (NP_...). Use transcript-level HGVS (NM_...) instead."
             log_api_step("VEP_SKIP", err_msg)
             return {"error": err_msg}
+        elif len(clean_hgvs.split(':')) == 4:
+            # Format is chr:pos:ref:alt for region lookup
+            url = f"https://rest.ensembl.org/vep/human/region/{quote(clean_hgvs, safe='')}"
         else:
-            url = f"{VEP_BASE}/{quote(hgvs, safe='')}"
+            url = f"{VEP_BASE}/{quote(clean_hgvs, safe='')}"
 
         log_api_step("VEP_HTTP_REQUEST", f"GET Request to: {url}")
         resp = requests.get(url, headers=headers, timeout=30)
@@ -154,14 +184,11 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
     """Query ClinVar via NCBI E-utilities (esearch.fcgi and esummary.fcgi)."""
     log_api_step("CLINVAR_QUERY", f"Querying ClinVar. Params - variation_id: {variation_id}, rsid: {rsid}, gene_symbol: {gene_symbol}")
     
-    if rsid:
-        rsid = rsid.replace('rs', '')
-    
     # Formulate search query
     if variation_id:
         search_term = f"{variation_id}[VariationID]"
     elif rsid:
-        search_term = f"{rsid}[rs]"
+        search_term = f"{rsid}"
     elif gene_symbol:
         search_term = f"{gene_symbol}[Gene Name]"
     else:
@@ -244,3 +271,232 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
         err_msg = f"Error querying ClinVar: {str(e)}"
         log_api_step("CLINVAR_ERROR", err_msg)
         return {"error": err_msg}
+
+def query_pubmed(query_term: str) -> List[Dict[str, Any]]:
+    """Query PubMed via NCBI E-utilities for papers related to a variant/gene."""
+    log_api_step("PUBMED_QUERY", f"Searching PubMed for: '{query_term}'")
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    search_params = {
+        "db": "pubmed",
+        "term": query_term,
+        "retmode": "json",
+        "retmax": 5
+    }
+    try:
+        log_api_step("PUBMED_SEARCH_REQUEST", f"GET Search Request to: {search_url} with query '{query_term}'")
+        resp = requests.get(search_url, params=search_params, timeout=15)
+        resp.raise_for_status()
+        search_data = resp.json()
+        id_list = search_data.get("esearchresult", {}).get("idlist", [])
+        if not id_list:
+            log_api_step("PUBMED_EMPTY", f"No papers found for term: '{query_term}'")
+            return []
+            
+        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        summary_params = {
+            "db": "pubmed",
+            "id": ",".join(id_list),
+            "retmode": "json"
+        }
+        log_api_step("PUBMED_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {id_list}")
+        resp2 = requests.get(summary_url, params=summary_params, timeout=15)
+        resp2.raise_for_status()
+        summary_data = resp2.json()
+        
+        results = []
+        result_dict = summary_data.get("result", {})
+        for pmid in id_list:
+            if pmid in result_dict:
+                paper = result_dict[pmid]
+                results.append({
+                    "pmid": pmid,
+                    "title": paper.get("title", "No Title"),
+                    "authors": ", ".join(author.get("name", "") for author in paper.get("authors", [])),
+                    "journal": paper.get("source", "Unknown Journal"),
+                    "pubdate": paper.get("pubdate", "Unknown Date"),
+                    "link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                })
+        log_api_step("PUBMED_PARSE", f"Successfully parsed {len(results)} PubMed papers", results)
+        return results
+    except Exception as e:
+        log_api_step("PUBMED_ERROR", f"Error querying PubMed: {str(e)}")
+        return []
+
+def query_myvariant_batch(ids: List[str]) -> List[Dict[str, Any]]:
+    """Query MyVariant.info in batch via POST with intelligent routing for rsIDs vs HGVS."""
+    log_api_step("MYVARIANT_BATCH_QUERY", f"Querying MyVariant.info in batch for {len(ids)} variants")
+    if not ids:
+        return []
+        
+    rsids = [i for i in ids if i.startswith("rs")]
+    hgvs_ids = [i for i in ids if not i.startswith("rs")]
+    
+    merged_results = []
+    
+    # Process HGVS IDs using /v1/variant
+    if hgvs_ids:
+        try:
+            url = "https://myvariant.info/v1/variant"
+            data = {"ids": ",".join(hgvs_ids), "assembly": "hg38"}
+            resp = requests.post(url, data=data, timeout=30)
+            resp.raise_for_status()
+            res_list = resp.json()
+            merged_results.extend(res_list)
+            log_api_step("MYVARIANT_BATCH_HGVS", f"Retrieved {len(res_list)} records for HGVS variants")
+        except Exception as e:
+            log_api_step("MYVARIANT_BATCH_ERROR", f"Error in MyVariant batch query (HGVS): {str(e)}")
+
+    # Process rsIDs using /v1/query
+    if rsids:
+        try:
+            url = "https://myvariant.info/v1/query"
+            data = {"q": ",".join(rsids), "scopes": "dbsnp.rsid,clinvar.rsid", "fields": "all"}
+            resp = requests.post(url, data=data, timeout=30)
+            resp.raise_for_status()
+            res_list = resp.json()
+            
+            # The query endpoint returns slightly different structure: [{"query": "rs123", "hits": [...]}, ...]
+            # Or just hit list depending on if we query by comma separated.
+            # Post to /v1/query returns a list of dicts with 'query' and either '_id' (if match) or 'notfound'.
+            for res in res_list:
+                # If there are multiple hits, take the best one, similar to single query logic
+                if "hits" in res and res["hits"]:
+                    hits = res["hits"]
+                    best_record = hits[0]
+                    best_score = -1
+                    for r in hits:
+                        if not isinstance(r, dict): continue
+                        score = 0
+                        if 'clinvar' in r: score += 10
+                        if 'gnomad_genome' in r or 'gnomad_exome' in r: score += 5
+                        if 'dbnsfp' in r: score += 3
+                        if 'uniprot' in r: score += 2
+                        score += len(r.keys()) * 0.1
+                        if score > best_score:
+                            best_score = score
+                            best_record = r
+                    # Give it the original query ID so prioritizer can match it
+                    best_record['query'] = res.get('query')
+                    merged_results.append(best_record)
+                elif "_id" in res:
+                    # Direct match
+                    merged_results.append(res)
+                elif "notfound" in res:
+                    merged_results.append(res)
+                    
+            log_api_step("MYVARIANT_BATCH_RSID", f"Processed {len(rsids)} rsID queries")
+        except Exception as e:
+            log_api_step("MYVARIANT_BATCH_ERROR", f"Error in MyVariant batch query (rsID): {str(e)}")
+
+    log_api_step("MYVARIANT_BATCH_PARSE", f"Returning {len(merged_results)} total records from MyVariant batch")
+    return merged_results
+
+def query_vep_batch(ids: List[str]) -> List[Dict[str, Any]]:
+    """Query Ensembl VEP in batch via POST (by rsID)."""
+    log_api_step("VEP_BATCH_QUERY", f"Querying Ensembl VEP in batch for {len(ids)} variants")
+    if not ids:
+        return []
+        
+    # Filter valid rsIDs or genomic coordinates (exclude '.' or empty)
+    valid_ids = [i for i in ids if isinstance(i, str) and (i.startswith("rs") or ":" in i)]
+    if not valid_ids:
+        return []
+        
+    all_results = []
+    chunk_size = 200
+    for i in range(0, len(valid_ids), chunk_size):
+        chunk = valid_ids[i:i + chunk_size]
+        try:
+            url = "https://rest.ensembl.org/vep/human/id"
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            payload = {"ids": chunk}
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            res_list = resp.json()
+            if isinstance(res_list, list):
+                all_results.extend(res_list)
+        except Exception as e:
+            log_api_step("VEP_BATCH_ERROR", f"Error in VEP batch chunk query: {str(e)}")
+            
+    log_api_step("VEP_BATCH_PARSE", f"Retrieved {len(all_results)} records from VEP batch")
+    return all_results
+
+def query_clinvar_batch(rsids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Query ClinVar via NCBI E-utilities in batch for a list of rsids."""
+    log_api_step("CLINVAR_BATCH_QUERY", f"Querying ClinVar in batch for rsids: {rsids}")
+    if not rsids:
+        return {}
+    
+    import re
+    clean_rsids = [r.replace('rs', '') for r in rsids]
+    term = " OR ".join(f"{r}[rs]" for r in clean_rsids)
+    search_url = f"{CLINVAR_BASE}/esearch.fcgi"
+    search_params = {
+        "db": "clinvar",
+        "term": term,
+        "retmode": "json",
+        "retmax": len(rsids) * 3
+    }
+    
+    try:
+        resp = requests.get(search_url, params=search_params, timeout=20)
+        resp.raise_for_status()
+        search_data = resp.json()
+        id_list = search_data.get("esearchresult", {}).get("idlist", [])
+        if not id_list:
+            log_api_step("CLINVAR_BATCH_EMPTY", "No ClinVar IDs found for these rsids")
+            return {}
+            
+        summary_url = f"{CLINVAR_BASE}/esummary.fcgi"
+        summary_params = {
+            "db": "clinvar",
+            "id": ",".join(id_list),
+            "retmode": "json"
+        }
+        resp2 = requests.get(summary_url, params=summary_params, timeout=20)
+        resp2.raise_for_status()
+        summary_data = resp2.json()
+        
+        result_dict = summary_data.get("result", {})
+        parsed_results = {}
+        for uid in id_list:
+            if uid in result_dict:
+                record = result_dict[uid]
+                germline = record.get("germline_classification", {})
+                clinical_sig = germline.get("description", "Not provided")
+                review_status = germline.get("review_status", "Not provided")
+                
+                conditions = []
+                for trait in germline.get("trait_set", []):
+                    trait_name = trait.get("trait_name")
+                    if trait_name:
+                        conditions.append(trait_name)
+                        
+                extracted_gene = None
+                if record.get("genes"):
+                    extracted_gene = record["genes"][0].get("symbol")
+                    
+                variation_rsid = None
+                title = record.get("title", "")
+                rs_match = re.search(r'rs\d+', title)
+                if rs_match:
+                    variation_rsid = rs_match.group(0)
+                else:
+                    variation_rsid = f"uid_{uid}"
+                
+                parsed_results[variation_rsid] = {
+                    "uid": uid,
+                    "title": title,
+                    "clinical_significance": clinical_sig,
+                    "review_status": review_status,
+                    "conditions": conditions,
+                    "gene_symbol": extracted_gene,
+                    "protein_change": record.get("protein_change"),
+                    "molecular_consequence": record.get("molecular_consequence_list", []),
+                }
+        log_api_step("CLINVAR_BATCH_PARSE", f"Successfully parsed {len(parsed_results)} ClinVar records", parsed_results)
+        return parsed_results
+    except Exception as e:
+        log_api_step("CLINVAR_BATCH_ERROR", f"Error in ClinVar batch query: {str(e)}")
+        return {}
+
