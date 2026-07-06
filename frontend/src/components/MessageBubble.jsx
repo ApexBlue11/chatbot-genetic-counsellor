@@ -73,7 +73,7 @@ function MessageBubble({ message }) {
             )}
             <details style={{ textAlign: 'left', marginTop: '1rem' }}>
               <summary style={{ fontSize: '0.8rem', color: 'var(--primary)', cursor: 'pointer' }}>View Raw Data</summary>
-              <pre style={{ fontSize: '0.75rem', marginTop: '0.5rem', maxHeight: '200px', overflowY: 'auto', background: '#fff', padding: '0.5rem', borderRadius: '4px' }}>
+              <pre style={{ fontSize: '0.75rem', marginTop: '0.5rem', maxHeight: '200px', overflowY: 'auto', background: '#fff', color: '#1E293B', padding: '0.5rem', borderRadius: '4px' }}>
                 {JSON.stringify(metadata.pedigree_data, null, 2)}
               </pre>
             </details>
