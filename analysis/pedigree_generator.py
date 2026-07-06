@@ -559,6 +559,32 @@ class PedigreeRenderer:
                     seen_parents.add(p_id)
             
             parent_gen["individuals"] = new_parent_order
+            
+        # Walk down generations (top-to-bottom) and sort children according to their parents' order
+        for idx in range(len(sorted_gen_indices) - 1, 0, -1):
+            parent_gen_idx = sorted_gen_indices[idx]
+            child_gen_idx = sorted_gen_indices[idx - 1]
+            
+            parent_gen = gen_by_index[parent_gen_idx]
+            child_gen = gen_by_index[child_gen_idx]
+            
+            ordered_parents = parent_gen.get("individuals", [])
+            child_individuals = child_gen.get("individuals", [])
+            
+            parent_order_map = {}
+            for p_order, p in enumerate(ordered_parents):
+                p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
+                parent_order_map[p_id] = p_order
+                
+            def child_sort_key(child):
+                child_id = child.get("id") if hasattr(child, "get") else getattr(child, "id", None)
+                parents_of_child = child_to_parents.get(child_id, [])
+                if not parents_of_child:
+                    return 9999
+                indices = [parent_order_map.get(pid, 9999) for pid in parents_of_child]
+                return min(indices)
+                
+            child_gen["individuals"] = sorted(child_individuals, key=child_sort_key)
         # -------------------------------------------------------------
         
         for gen_data in generations:
@@ -610,17 +636,20 @@ class PedigreeRenderer:
             if not child_pos:
                 continue
             
+            # Use exact midpoint between generations for horizontal connector lines
+            mid_generation_y = child_pos[1] - self.generation_spacing / 2
+            
             if len(parent_ids) == 1:
                 # Single parent
                 parent_pos = self.positions.get(parent_ids[0])
                 if parent_pos:
                     mid_y = parent_pos[1] + self.symbol_size/2
                     # Orthogonal routing: down, sideways, down to child
-                    draw.line([parent_pos[0], mid_y, parent_pos[0], child_pos[1] - 20],
+                    draw.line([parent_pos[0], mid_y, parent_pos[0], mid_generation_y],
                              fill=self.colors["connection"], width=2)
-                    draw.line([parent_pos[0], child_pos[1] - 20, child_pos[0], child_pos[1] - 20],
+                    draw.line([parent_pos[0], mid_generation_y, child_pos[0], mid_generation_y],
                              fill=self.colors["connection"], width=2)
-                    draw.line([child_pos[0], child_pos[1] - 20, child_pos[0], child_pos[1] - self.symbol_size/2],
+                    draw.line([child_pos[0], mid_generation_y, child_pos[0], child_pos[1] - self.symbol_size/2],
                              fill=self.colors["connection"], width=2)
             elif len(parent_ids) == 2:
                 # Both parents
@@ -632,13 +661,13 @@ class PedigreeRenderer:
                     mid_y = (parent1_pos[1] + parent2_pos[1]) / 2
                     
                     # Vertical line from parents' midpoint down
-                    draw.line([mid_x, mid_y + 20, mid_x, child_pos[1] - 20],
+                    draw.line([mid_x, mid_y + 15, mid_x, mid_generation_y],
                              fill=self.colors["connection"], width=2)
                     # Horizontal line to child
-                    draw.line([mid_x, child_pos[1] - 20, child_pos[0], child_pos[1] - 20],
+                    draw.line([mid_x, mid_generation_y, child_pos[0], mid_generation_y],
                              fill=self.colors["connection"], width=2)
                     # Final vertical line to child
-                    draw.line([child_pos[0], child_pos[1] - 20,
+                    draw.line([child_pos[0], mid_generation_y,
                               child_pos[0], child_pos[1] - self.symbol_size/2],
                              fill=self.colors["connection"], width=2)
     
@@ -715,9 +744,10 @@ class PedigreeRenderer:
             draw.text((x - t_w/2, y - t_h/2 - 2), "?", fill=self.colors["text"], font=font_name)
 
         if individual.get("deceased") or individual["status"] == "deceased":
-            # Deceased diagonal line
+            # Deceased diagonal line (draw in white if symbol is black/affected)
+            diagonal_color = "#ffffff" if individual["status"] == "affected" else self.colors["border"]
             draw.line([x - half_size, y - half_size, x + half_size, y + half_size],
-                     fill=self.colors["border"], width=2)
+                     fill=diagonal_color, width=2)
         
         # Add labels with word-wrapping
         name = individual["name"]
