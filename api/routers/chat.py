@@ -289,6 +289,12 @@ def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_contex
 
     try:
         response_text, model_used, metadata = generate_with_agent(genai, prompt)
+        
+        import re
+        # Strip any markdown image references containing base64 data URIs
+        response_text = re.sub(r'!\[.*?\]\(data:image/.*?;base64,.*?\)', '', response_text)
+        response_text = re.sub(r'\n{3,}', '\n\n', response_text).strip()
+
         full_response = response_text
         if metadata and metadata.get("type") == "pedigree_chart":
             full_response += "\n\n*[Pedigree chart generated]*"

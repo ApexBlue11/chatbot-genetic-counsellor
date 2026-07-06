@@ -327,6 +327,8 @@ def read_enriched_data(patient_label: str, variant_ids: str) -> str:
         return json.dumps(results, indent=2)
     except Exception as e:
         return f"Error reading enriched data: {str(e)}"
+# Module-level pedigree image storage to avoid passing massive base64 text back to LLM context
+_LAST_PEDIGREE_IMAGE: Optional[str] = None
 
 
 def create_pedigree_chart(family_description: str) -> str:
@@ -349,17 +351,21 @@ def create_pedigree_chart(family_description: str) -> str:
     """
     from analysis.pedigree_generator import PedigreeGenerator
     import base64
+    global _LAST_PEDIGREE_IMAGE
 
     try:
         generator = PedigreeGenerator(api_key=load_gemini_api_key())
         pedigree_data = generator.parse_family_description(family_description, use_ai=True)
         png_bytes = generator.generate_png_bytes(pedigree_data)
         b64_image = base64.b64encode(png_bytes).decode('utf-8')
+        
+        # Save to global variable so generate_with_agent can retrieve it without bloating Gemini's context
+        _LAST_PEDIGREE_IMAGE = b64_image
+        
         return json.dumps({
             "status": "success",
-            "message": f"Pedigree generated with {len(pedigree_data.get('individuals', []))} individuals.",
+            "message": f"Pedigree generated successfully with {len(pedigree_data.get('individuals', []))} individuals. The chart has been rendered and shown in the UI.",
             "pedigree_data": pedigree_data,
-            "image_base64": b64_image,
             "_INTERNAL_MARKER_PEDIGREE": True
         }, indent=2)
     except Exception as e:
@@ -384,6 +390,9 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
     """
     models = discover_text_models(genai)
     last_error = None
+    
+    global _LAST_PEDIGREE_IMAGE
+    _LAST_PEDIGREE_IMAGE = None
 
     tools = [
         search_pubmed,
@@ -404,19 +413,58 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
 
             metadata = None
             for msg in chat.history:
-                if msg.parts:
-                    for part in msg.parts:
-                        if hasattr(part, "function_response") and part.function_response.name == "create_pedigree_chart":
-                            try:
-                                resp_dict = type(part.function_response.response).to_dict(part.function_response.response)
-                                if "pedigree_data" in resp_dict:
-                                    metadata = {
-                                        "type": "pedigree_chart",
-                                        "pedigree_data": resp_dict["pedigree_data"],
-                                        "image_base64": resp_dict.get("image_base64")
-                                    }
-                            except Exception:
-                                pass
+                parts = getattr(msg, "parts", None) or []
+                for part in parts:
+                    func_resp = getattr(part, "function_response", None)
+                    if func_resp and getattr(func_resp, "name", None) == "create_pedigree_chart":
+                        try:
+                            resp = getattr(func_resp, "response", None)
+                            if resp is None:
+                                continue
+                            resp_dict = {}
+                            
+                            # Try multiple conversion styles
+                            if hasattr(resp, "items"):
+                                try:
+                                    resp_dict = dict(resp.items())
+                                except Exception:
+                                    pass
+                            
+                            if not resp_dict:
+                                if isinstance(resp, dict):
+                                    resp_dict = resp
+                                elif hasattr(resp, "to_dict"):
+                                    resp_dict = resp.to_dict()
+                                elif hasattr(type(resp), "to_dict"):
+                                    resp_dict = type(resp).to_dict(resp)
+                                else:
+                                    # Fallback attribute checking
+                                    for key in ["pedigree_data", "image_base64", "status", "message", "result"]:
+                                        if hasattr(resp, key):
+                                            resp_dict[key] = getattr(resp, key)
+                                
+                            # Unpack 'result' string if wrapped by protobuf MapComposite
+                            if "result" in resp_dict and isinstance(resp_dict["result"], str):
+                                try:
+                                    resp_dict = json.loads(resp_dict["result"])
+                                except Exception:
+                                    pass
+
+                            from analysis.pedigree_generator import log_pedigree_step
+                            if "pedigree_data" in resp_dict or resp_dict.get("status") == "success" or resp_dict.get("_INTERNAL_MARKER_PEDIGREE"):
+                                metadata = {
+                                    "type": "pedigree_chart",
+                                    "pedigree_data": resp_dict.get("pedigree_data", {}),
+                                    "image_base64": _LAST_PEDIGREE_IMAGE
+                                }
+                                log_pedigree_step("PEDIGREE_METADATA_EXTRACT", "Successfully extracted pedigree chart metadata", {
+                                    "has_image": bool(metadata["image_base64"]),
+                                    "individuals_count": len(metadata["pedigree_data"].get("individuals", []))
+                                })
+                        except Exception as ex:
+                            from analysis.pedigree_generator import log_pedigree_step
+                            log_pedigree_step("PEDIGREE_METADATA_ERROR", "Failed to convert function response to metadata dict", {"error": str(ex)})
+                            pass
 
             return response.text, model_name, metadata
 
