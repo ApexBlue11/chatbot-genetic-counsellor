@@ -349,7 +349,21 @@ RULES:
         for i, person in enumerate(data["individuals"]):
             person["id"] = person.get("id") or person.get("name", "").lower() or f"person_{i}"
             person["name"] = person.get("name") or f"Person {i + 1}"
-            person["gender"] = person.get("gender", "unknown")
+            # Infer gender from name/id if unknown
+            gender_val = person.get("gender", "unknown").lower()
+            name_lower = (person.get("name") or "").lower()
+            id_lower = (person.get("id") or "").lower()
+            
+            if gender_val == "unknown":
+                male_words = ["father", "dad", "son", "brother", "grandfather", "grandpa", "uncle", "husband", "male", "grandfather"]
+                female_words = ["mother", "mom", "daughter", "sister", "grandmother", "grandma", "aunt", "wife", "female", "grandmother"]
+                
+                if any(w in name_lower or w in id_lower for w in male_words):
+                    gender_val = "male"
+                elif any(w in name_lower or w in id_lower for w in female_words):
+                    gender_val = "female"
+            
+            person["gender"] = gender_val
             if person["gender"] not in ["male", "female", "unknown"]:
                 person["gender"] = "unknown"
             person["status"] = person.get("status", "unaffected")
