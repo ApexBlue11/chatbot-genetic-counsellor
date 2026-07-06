@@ -353,7 +353,7 @@ RULES:
             if person["gender"] not in ["male", "female", "unknown"]:
                 person["gender"] = "unknown"
             person["status"] = person.get("status", "unaffected")
-            if person["status"] not in ["unaffected", "affected", "carrier", "deceased"]:
+            if person["status"] not in ["unaffected", "affected", "carrier", "deceased", "unknown"]:
                 person["status"] = "unaffected"
             person["deceased"] = person.get("deceased", False) or person.get("status") == "deceased"
             person["conditions"] = person.get("conditions", [])
@@ -445,6 +445,89 @@ class PedigreeRenderer:
                 {"generation": gen, "individuals": indivs}
                 for gen, indivs in sorted(gen_map.items())
             ]
+        
+        # --- Topological-like sorting to prevent line crossings ---
+        relationships = pedigree_data.get("relationships", [])
+        
+        # Build child-to-parents map
+        child_to_parents = {}
+        for rel in relationships:
+            is_rel_dict = hasattr(rel, "get")
+            if (rel.get("type") if is_rel_dict else getattr(rel, "type", "")) == "parent-child":
+                child = rel.get("person2") if is_rel_dict else getattr(rel, "person2", "")
+                parent = rel.get("person1") if is_rel_dict else getattr(rel, "person1", "")
+                if child not in child_to_parents:
+                    child_to_parents[child] = []
+                child_to_parents[child].append(parent)
+        
+        # Sort each generation's individuals bottom-to-top
+        sorted_gen_indices = sorted([g.get("generation", 0) for g in generations], reverse=True)
+        gen_by_index = {g.get("generation", 0): g for g in generations}
+        
+        if sorted_gen_indices:
+            # Sort bottom generation (keep patient/proband first)
+            bottom_idx = sorted_gen_indices[0]
+            bottom_gen = gen_by_index[bottom_idx]
+            indivs = bottom_gen.get("individuals", [])
+            
+            def bottom_key(ind):
+                name = (ind.get("name") if hasattr(ind, "get") else getattr(ind, "name", "")).lower()
+                ind_id = (ind.get("id") if hasattr(ind, "get") else getattr(ind, "id", "")).lower()
+                if "patient" in name or "proband" in name or "patient" in ind_id or "proband" in ind_id:
+                    return 0
+                return 1
+            bottom_gen["individuals"] = sorted(indivs, key=bottom_key)
+            
+        # Walk up generations and sort parents according to child order
+        for idx in range(len(sorted_gen_indices) - 1):
+            current_gen_idx = sorted_gen_indices[idx]
+            parent_gen_idx = sorted_gen_indices[idx + 1]
+            
+            current_gen = gen_by_index[current_gen_idx]
+            parent_gen = gen_by_index[parent_gen_idx]
+            
+            ordered_children = current_gen.get("individuals", [])
+            parent_individuals = parent_gen.get("individuals", [])
+            
+            new_parent_order = []
+            seen_parents = set()
+            
+            for child in ordered_children:
+                child_id = child.get("id") if hasattr(child, "get") else getattr(child, "id", None)
+                parents_of_child = child_to_parents.get(child_id, [])
+                
+                # Fetch parent objects
+                sorted_parents = []
+                for p_id in parents_of_child:
+                    p_obj = next((p for p in parent_individuals if (p.get("id") if hasattr(p, "get") else getattr(p, "id", None)) == p_id), None)
+                    if p_obj:
+                        sorted_parents.append(p_obj)
+                
+                # Sort parents: male (father) on the left, female (mother) on the right
+                def gender_key(p):
+                    g = (p.get("gender") if hasattr(p, "get") else getattr(p, "gender", "")).lower()
+                    if g == "male":
+                        return 0
+                    if g == "female":
+                        return 1
+                    return 2
+                sorted_parents = sorted(sorted_parents, key=gender_key)
+                
+                for p in sorted_parents:
+                    p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
+                    if p_id not in seen_parents:
+                        new_parent_order.append(p)
+                        seen_parents.add(p_id)
+            
+            # Add any leftover parent individuals (e.g. aunts, uncles with no children in chart)
+            for p in parent_individuals:
+                p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
+                if p_id not in seen_parents:
+                    new_parent_order.append(p)
+                    seen_parents.add(p_id)
+            
+            parent_gen["individuals"] = new_parent_order
+        # -------------------------------------------------------------
         
         for gen_data in generations:
             gen_index = gen_data.get("generation", 0)
@@ -587,24 +670,49 @@ class PedigreeRenderer:
             draw.ellipse([x - 4, y - 4, x + 4, y + 4],
                         fill=self.colors["carrier"], outline=None)
         
+        if individual["status"] == "unknown":
+            # Draw "?" inside symbol to indicate unknown disease status
+            bbox = draw.textbbox((0, 0), "?", font=font_name)
+            t_w = bbox[2] - bbox[0]
+            t_h = bbox[3] - bbox[1]
+            draw.text((x - t_w/2, y - t_h/2 - 2), "?", fill=self.colors["text"], font=font_name)
+
         if individual.get("deceased") or individual["status"] == "deceased":
             # Deceased diagonal line
             draw.line([x - half_size, y - half_size, x + half_size, y + half_size],
                      fill=self.colors["border"], width=2)
         
-        # Add labels
-        # Name
-        bbox = draw.textbbox((0, 0), individual["name"], font=font_name)
-        text_width = bbox[2] - bbox[0]
-        draw.text((x - text_width/2, y + half_size + 5),
-                 individual["name"], fill=self.colors["text"], font=font_name)
+        # Add labels with word-wrapping
+        name = individual["name"]
+        words = name.split()
+        lines = []
+        current_line = []
+        for word in words:
+            if len(" ".join(current_line + [word])) > 12:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                    current_line = [word]
+                else:
+                    lines.append(word)
+            else:
+                current_line.append(word)
+        if current_line:
+            lines.append(" ".join(current_line))
+            
+        y_offset = y + half_size + 5
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font_name)
+            t_w = bbox[2] - bbox[0]
+            t_h = bbox[3] - bbox[1]
+            draw.text((x - t_w/2, y_offset), line, fill=self.colors["text"], font=font_name)
+            y_offset += t_h + 2
         
         # Age
         if individual.get("age"):
             age_text = f"{individual['age']}y"
             bbox = draw.textbbox((0, 0), age_text, font=font_age)
             text_width = bbox[2] - bbox[0]
-            draw.text((x - text_width/2, y + half_size + 20),
+            draw.text((x - text_width/2, y_offset),
                      age_text, fill="#666666", font=font_age)
     
     def export_as_png(self, pedigree_data: Dict[str, Any]) -> bytes:

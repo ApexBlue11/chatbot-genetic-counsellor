@@ -343,7 +343,7 @@ def create_pedigree_chart(individuals: list, relationships: list) -> dict:
       - id: Unique short string identifier (e.g. "proband", "father", "mother", "sister1")
       - name: Display name
       - gender: Gender string, must be one of: "male", "female", "unknown"
-      - status: Disease status, must be one of: "affected", "carrier", "unaffected"
+      - status: Disease status, must be one of: "affected", "carrier", "unaffected", "unknown"
       - deceased: Boolean flag (true if deceased, false otherwise)
       
     relationships: List of dicts representing connections. Each dict must contain:

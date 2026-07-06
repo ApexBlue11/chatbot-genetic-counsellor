@@ -115,6 +115,15 @@ VariantMind's LLM agent is equipped with five tools to gather live literature an
 4. `search_pubmed`: Perform targeted search queries for literature.
 5. `create_pedigree_chart`: Generate pedigree metadata to render family histories.
 
+### 4. Single-Call Pedigree Engine & Sorter
+VariantMind features a single-call pedigree rendering pipeline that accepts family lineage inputs from the LLM agent and renders them as standard medical charts:
+* **Topological Layout Sorter**: To prevent crossing connection lines, the rendering engine walks the pedigree tree bottom-up (from children to grandparents) and sorts spouses side-by-side (Father on left, Mother on right). This places Paternal lineages cleanly on the left side of the chart and Maternal lineages on the right side of the chart.
+* **Smart Name Label Wrapping**: Name labels are wrapped onto multiple lines if they exceed 12 characters, avoiding overlapping text fields.
+* **Clinical Genetic Standards**: Supports standard clinical symbols:
+  - Squares for males, circles for females, diamonds for unknown gender.
+  - Filled symbols for affected individuals, center dot overlays for carriers, and diagonal lines for deceased status.
+  - A question mark (`?`) symbol centered inside the shape for individuals with **unknown disease status**.
+
 ---
 
 ## 🧪 Running Developer Test Suites
