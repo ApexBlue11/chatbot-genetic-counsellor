@@ -241,12 +241,47 @@ class GeminiPedigreeParser:
             'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
         ]
     
+    def query_gemini(self, system_prompt: str, user_content: str) -> str:
+        """Helper to query Gemini using direct REST fallbacks or client SDK"""
+        # Attempt 1: Standard SDK integration
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(f"{system_prompt}\n\nCONTENT:\n{user_content}")
+            return response.text
+        except Exception:
+            pass
+
+        # Attempt 2: REST fallback endpoints
+        body = {
+            "contents": [{
+                "parts": [{"text": f"{system_prompt}\n\nCONTENT:\n{user_content}"}]
+            }]
+        }
+        for endpoint in self.endpoints:
+            try:
+                response = requests.post(
+                    f"{endpoint}?key={self.api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=body,
+                    timeout=45
+                )
+                if response.ok:
+                    data = response.json()
+                    if "candidates" in data and data["candidates"]:
+                        parts = data["candidates"][0].get("content", {}).get("parts", [])
+                        return "".join([p.get("text", "") for p in parts])
+            except Exception:
+                pass
+        raise RuntimeError("Failed to query Gemini API model on all endpoints")
+
     def parse_to_json(self, prompt: str) -> Dict[str, Any]:
-        """Parse family description using Gemini AI"""
+        """Parse family description using a two-pass Gemini AI pipeline"""
         log_pedigree_step("PEDIGREE_INPUT", "Processing raw family description input", {"prompt": prompt})
 
-        system_prompt = """You are a medical genetics expert. Convert the following family description into a strictly valid JSON object for pedigree tree generation.
-
+        # PASS 1: Translate raw description to JSON individuals and relationships
+        pass1_system = """You are a medical genetics expert. Convert the following family description into a strictly valid JSON object for pedigree tree generation.
 REQUIRED JSON STRUCTURE:
 {
   "individuals": [
@@ -255,7 +290,7 @@ REQUIRED JSON STRUCTURE:
       "name": "Full Name",
       "gender": "male|female|unknown",
       "age": number|null,
-      "status": "unaffected|affected|carrier|deceased",
+      "status": "unaffected|affected|carrier|deceased|unknown",
       "conditions": ["condition1", "condition2"],
       "deceased": boolean,
       "generation": number
@@ -269,71 +304,54 @@ REQUIRED JSON STRUCTURE:
     }
   ]
 }
-
 RULES:
 1) Output ONLY raw JSON with double quotes; no markdown or prose.
 2) Use lowercase names as ids (e.g., "john").
-3) If information is missing, infer conservatively and keep fields valid.
-4) Create BOTH parent-child links for each parent to each child.
-5) Keep arrays present even if empty."""
+3) Create BOTH parent-child links for each parent to each child."""
 
-        # Attempt 1: Standard SDK integration using google-generativeai client
+        pass1_text = self.query_gemini(pass1_system, prompt)
+        log_pedigree_step("PEDIGREE_PASS1_RESPONSE", "Received raw text from Pass 1", {"text": pass1_text[:200]})
+        
+        json_match = re.search(r'\{[\s\S]*\}', pass1_text)
+        if not json_match:
+            raise ValueError("Pass 1 did not return any JSON object")
+        
+        raw_data = json.loads(json_match.group(0))
+
+        # PASS 2: Review and optimize generation indices & sibling order to prevent criss-crossing lines
+        pass2_system = """You are a visual layout engineer for pedigree charts. Your goal is to optimize the generation values and the relative horizontal ordering of individuals inside the 'individuals' list to prevent crossing connection lines when drawing the pedigree.
+
+INPUT JSON:
+{individuals, relationships}
+
+OPTIMIZATION RULES:
+1. GENERATION ALIGNMENT: 
+   - Parents must be on the exact same generation level (e.g., Generation N).
+   - Children of the same parents must be on the exact same generation level (Generation N+1).
+   - Partners of a child (spouses) must also be on the same level (Generation N+1).
+   - Adjust the 'generation' values in the 'individuals' list to be mathematically correct based on parent-child lineages.
+
+2. HORIZONTAL PLACEMENT & ORDER (CRITICAL to prevent line overlaps):
+   - You must reorder the 'individuals' array from left to right.
+   - Spouses/partners (marriage connection) MUST be placed adjacent to each other in the array (e.g. if John marries Jane, they must be next to each other).
+   - The Paternal grandparents should be on the far left, and Maternal grandparents should be on the right.
+   - Consequently, the Father (and his siblings) must be to the left, and the Mother (and her siblings) must be to the right, aligning directly under their parents.
+   - Look at the parent-child lines: if a couple has children, position the couple directly above their children. If the husband's parents are on the left, place the husband on the left of his wife.
+   
+3. OUTPUT:
+   - Output ONLY the optimized JSON structure; no markdown, no comments, no prose."""
+
         try:
-            log_pedigree_step("PEDIGREE_AI_REQUEST", "Attempting SDK-based generative model parsing", {"model": "gemini-2.5-flash"})
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content(f"{system_prompt}\n\nFAMILY DESCRIPTION:\n{prompt}")
-            text = response.text
-            log_pedigree_step("PEDIGREE_AI_RESPONSE", "Received raw text from SDK client", {"text": text[:300]})
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                return self.validate_and_clean_json(parsed)
-        except Exception as sdk_err:
-            log_pedigree_step("PEDIGREE_SDK_WARNING", "SDK parsing failed or import error; falling back to direct endpoints", {"error": str(sdk_err)})
-
-        # Attempt 2: REST fallback endpoints
-        body = {
-            "contents": [{
-                "parts": [{"text": f"{system_prompt}\n\nFAMILY DESCRIPTION:\n{prompt}"}]
-            }]
-        }
-        
-        last_error = None
-        for endpoint in self.endpoints:
-            try:
-                log_pedigree_step("PEDIGREE_HTTP_REQUEST", f"POST query to direct REST endpoint", {"url": endpoint})
-                response = requests.post(
-                    f"{endpoint}?key={self.api_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=body,
-                    timeout=45
-                )
-                if not response.ok:
-                    last_error = Exception(f"Gemini API HTTP error: {response.status_code}")
-                    continue
-                
-                data = response.json()
-                text = ""
-                if "candidates" in data and data["candidates"]:
-                    parts = data["candidates"][0].get("content", {}).get("parts", [])
-                    text = "".join([p.get("text", "") for p in parts])
-                
-                log_pedigree_step("PEDIGREE_AI_RESPONSE", "Received raw text from REST fallback", {"text": text[:300]})
-                json_match = re.search(r'\{[\s\S]*\}', text)
-                if not json_match:
-                    last_error = Exception("No valid JSON found in response")
-                    continue
-                
-                parsed = json.loads(json_match.group(0))
-                return self.validate_and_clean_json(parsed)
-                
-            except Exception as e:
-                last_error = e
-        
-        log_pedigree_step("PEDIGREE_AI_FATAL", "All pedigree parser execution routes exhausted", {"last_error": str(last_error)})
-        raise last_error or Exception("Gemini API failed on all endpoints")
+            pass2_text = self.query_gemini(pass2_system, json.dumps(raw_data, indent=2))
+            log_pedigree_step("PEDIGREE_PASS2_RESPONSE", "Received raw text from Pass 2", {"text": pass2_text[:200]})
+            
+            json_match2 = re.search(r'\{[\s\S]*\}', pass2_text)
+            if json_match2:
+                raw_data = json.loads(json_match2.group(0))
+        except Exception as e:
+            log_pedigree_step("PEDIGREE_PASS2_WARNING", "Pass 2 optimization failed; using Pass 1 output", {"error": str(e)})
+            
+        return self.validate_and_clean_json(raw_data)
     
     def validate_and_clean_json(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and clean the JSON structure"""
@@ -394,12 +412,12 @@ RULES:
 class PedigreeRenderer:
     """Renders pedigree trees using PIL/Pillow (Python equivalent of Fabric.js renderer)"""
     
-    def __init__(self, width: int = 800, height: int = 600):
+    def __init__(self, width: int = 1200, height: int = 800):
         self.width = width
         self.height = height
-        self.symbol_size = 30
-        self.generation_spacing = 100
-        self.individual_spacing = 80
+        self.symbol_size = 36
+        self.generation_spacing = 160
+        self.individual_spacing = 140
         self.colors = {
             "male": "#ffffff",
             "female": "#ffffff",
@@ -596,8 +614,13 @@ class PedigreeRenderer:
                 # Single parent
                 parent_pos = self.positions.get(parent_ids[0])
                 if parent_pos:
-                    draw.line([parent_pos[0], parent_pos[1] + self.symbol_size/2,
-                              child_pos[0], child_pos[1] - self.symbol_size/2],
+                    mid_y = parent_pos[1] + self.symbol_size/2
+                    # Orthogonal routing: down, sideways, down to child
+                    draw.line([parent_pos[0], mid_y, parent_pos[0], child_pos[1] - 20],
+                             fill=self.colors["connection"], width=2)
+                    draw.line([parent_pos[0], child_pos[1] - 20, child_pos[0], child_pos[1] - 20],
+                             fill=self.colors["connection"], width=2)
+                    draw.line([child_pos[0], child_pos[1] - 20, child_pos[0], child_pos[1] - self.symbol_size/2],
                              fill=self.colors["connection"], width=2)
             elif len(parent_ids) == 2:
                 # Both parents
@@ -770,7 +793,7 @@ class PedigreeGenerator:
         return self.simple_parser.parse(description)
     
     def _organize_generations(self, pedigree_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Organize individuals into proper generations"""
+        """Organize individuals into proper generations using spouse and parent-child constraint solver"""
         log_pedigree_step("PEDIGREE_ORGANIZE_START", "Organizing pedigree individuals into generations")
         individuals = pedigree_data["individuals"]
         relationships = pedigree_data.get("relationships", [])
@@ -781,59 +804,97 @@ class PedigreeGenerator:
             if rel.get("type") == "parent-child":
                 has_parents.add(rel.get("person2"))
         
-        # Assign generation 0 to roots
+        # Assign initial generation levels: roots get 0, others get -1
         for individual in individuals:
             is_dict_like = hasattr(individual, "get")
             ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
-            if ind_id not in has_parents:
+            
+            # Check if this individual has explicit generation from the visual pass
+            explicit_gen = individual.get("generation") if is_dict_like else getattr(individual, "generation", -1)
+            
+            # If not explicitly assigned a valid level >= 0, initialize
+            if explicit_gen is None or explicit_gen < 0:
+                init_val = 0 if ind_id not in has_parents else -1
                 if is_dict_like:
-                    individual["generation"] = 0
+                    individual["generation"] = init_val
                 else:
                     try:
-                        individual.generation = 0
-                    except Exception:
-                        pass
-            else:
-                if is_dict_like:
-                    individual["generation"] = -1  # Will be calculated
-                else:
-                    try:
-                        individual.generation = -1
+                        individual.generation = init_val
                     except Exception:
                         pass
         
-        # Propagate generations downward
-        max_iterations = 10
+        # Iteratively solve constraints: 
+        # 1. child.generation = parent.generation + 1
+        # 2. spouse1.generation == spouse2.generation
+        max_iterations = 20
         changed = True
         
         while changed and max_iterations > 0:
             changed = False
             max_iterations -= 1
             
+            # Constraint 1: Parent-Child propagation
             for rel in relationships:
                 is_rel_dict = hasattr(rel, "get")
-                if (rel.get("type") if is_rel_dict else getattr(rel, "type", None)) == "parent-child":
+                rel_type = rel.get("type") if is_rel_dict else getattr(rel, "type", "")
+                if rel_type == "parent-child":
                     parent_id = rel.get("person1") if is_rel_dict else getattr(rel, "person1", None)
                     child_id = rel.get("person2") if is_rel_dict else getattr(rel, "person2", None)
                     
-                    parent = next((i for i in individuals 
-                                 if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == parent_id), None)
-                    child = next((i for i in individuals 
-                                if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == child_id), None)
+                    parent = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == parent_id), None)
+                    child = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == child_id), None)
                     
                     if parent and child:
                         parent_is_dict = hasattr(parent, "get")
                         child_is_dict = hasattr(child, "get")
                         parent_gen = parent.get("generation") if parent_is_dict else getattr(parent, "generation", -1)
-                        if parent_gen >= 0:
+                        child_gen = child.get("generation") if child_is_dict else getattr(child, "generation", -1)
+                        
+                        if parent_gen >= 0 and child_gen != parent_gen + 1:
                             expected_gen = parent_gen + 1
-                            child_gen = child.get("generation") if child_is_dict else getattr(child, "generation", -1)
-                            if child_gen != expected_gen:
-                                if child_is_dict:
-                                    child["generation"] = expected_gen
+                            if child_is_dict:
+                                child["generation"] = expected_gen
+                            else:
+                                try:
+                                    child.generation = expected_gen
+                                except Exception:
+                                    pass
+                            changed = True
+            
+            # Constraint 2: Spouse generation equivalence
+            for rel in relationships:
+                is_rel_dict = hasattr(rel, "get")
+                rel_type = rel.get("type") if is_rel_dict else getattr(rel, "type", "")
+                if rel_type == "marriage":
+                    p1_id = rel.get("person1") if is_rel_dict else getattr(rel, "person1", None)
+                    p2_id = rel.get("person2") if is_rel_dict else getattr(rel, "person2", None)
+                    
+                    p1 = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == p1_id), None)
+                    p2 = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == p2_id), None)
+                    
+                    if p1 and p2:
+                        p1_is_dict = hasattr(p1, "get")
+                        p2_is_dict = hasattr(p2, "get")
+                        p1_gen = p1.get("generation") if p1_is_dict else getattr(p1, "generation", -1)
+                        p2_gen = p2.get("generation") if p2_is_dict else getattr(p2, "generation", -1)
+                        
+                        if p1_gen >= 0 or p2_gen >= 0:
+                            target_gen = max(p1_gen, p2_gen)
+                            if p1_gen != target_gen:
+                                if p1_is_dict:
+                                    p1["generation"] = target_gen
                                 else:
                                     try:
-                                        child.generation = expected_gen
+                                        p1.generation = target_gen
+                                    except Exception:
+                                        pass
+                                changed = True
+                            if p2_gen != target_gen:
+                                if p2_is_dict:
+                                    p2["generation"] = target_gen
+                                else:
+                                    try:
+                                        p2.generation = target_gen
                                     except Exception:
                                         pass
                                 changed = True
