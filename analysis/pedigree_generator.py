@@ -456,7 +456,8 @@ class PedigreeRenderer:
             
             for idx, individual in enumerate(individuals):
                 x = start_x + (idx * self.individual_spacing) if len(individuals) > 1 else self.width / 2
-                ind_id = individual.get("id") if isinstance(individual, dict) else individual.id
+                is_dict_like = hasattr(individual, "get")
+                ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
                 self.positions[ind_id] = (x, y)
     
     def draw_connections(self, draw: ImageDraw.Draw, pedigree_data: Dict[str, Any]):
@@ -525,16 +526,27 @@ class PedigreeRenderer:
                         font_name, font_age):
         """Draw all individual symbols"""
         for individual in pedigree_data.get("individuals", []):
-            ind_id = individual.get("id") if isinstance(individual, dict) else individual.id
+            is_dict_like = hasattr(individual, "get")
+            ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
             pos = self.positions.get(ind_id)
             if not pos:
                 continue
             
             x, y = pos
-            # Convert Individual dataclass to dict if needed
-            if not isinstance(individual, dict):
-                individual = asdict(individual)
-            self.draw_symbol(draw, individual, x, y, font_name, font_age)
+            # Convert to dictionary safely
+            ind_dict = {}
+            if is_dict_like:
+                try:
+                    ind_dict = dict(individual.items())
+                except Exception:
+                    ind_dict = individual
+            else:
+                try:
+                    ind_dict = asdict(individual)
+                except Exception:
+                    ind_dict = individual
+            
+            self.draw_symbol(draw, ind_dict, x, y, font_name, font_age)
     
     def draw_symbol(self, draw: ImageDraw.Draw, individual: Dict[str, Any],
                    x: float, y: float, font_name, font_age):
@@ -649,17 +661,24 @@ class PedigreeGenerator:
         
         # Assign generation 0 to roots
         for individual in individuals:
-            ind_id = individual.get("id") if isinstance(individual, dict) else individual.id
+            is_dict_like = hasattr(individual, "get")
+            ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
             if ind_id not in has_parents:
-                if isinstance(individual, dict):
+                if is_dict_like:
                     individual["generation"] = 0
                 else:
-                    individual.generation = 0
+                    try:
+                        individual.generation = 0
+                    except Exception:
+                        pass
             else:
-                if isinstance(individual, dict):
+                if is_dict_like:
                     individual["generation"] = -1  # Will be calculated
                 else:
-                    individual.generation = -1
+                    try:
+                        individual.generation = -1
+                    except Exception:
+                        pass
         
         # Propagate generations downward
         max_iterations = 10
@@ -670,31 +689,38 @@ class PedigreeGenerator:
             max_iterations -= 1
             
             for rel in relationships:
-                if rel.get("type") == "parent-child":
-                    parent_id = rel.get("person1")
-                    child_id = rel.get("person2")
+                is_rel_dict = hasattr(rel, "get")
+                if (rel.get("type") if is_rel_dict else getattr(rel, "type", None)) == "parent-child":
+                    parent_id = rel.get("person1") if is_rel_dict else getattr(rel, "person1", None)
+                    child_id = rel.get("person2") if is_rel_dict else getattr(rel, "person2", None)
                     
                     parent = next((i for i in individuals 
-                                 if (i.get("id") if isinstance(i, dict) else i.id) == parent_id), None)
+                                 if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == parent_id), None)
                     child = next((i for i in individuals 
-                                if (i.get("id") if isinstance(i, dict) else i.id) == child_id), None)
+                                if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == child_id), None)
                     
                     if parent and child:
-                        parent_gen = parent.get("generation") if isinstance(parent, dict) else parent.generation
+                        parent_is_dict = hasattr(parent, "get")
+                        child_is_dict = hasattr(child, "get")
+                        parent_gen = parent.get("generation") if parent_is_dict else getattr(parent, "generation", -1)
                         if parent_gen >= 0:
                             expected_gen = parent_gen + 1
-                            child_gen = child.get("generation") if isinstance(child, dict) else child.generation
+                            child_gen = child.get("generation") if child_is_dict else getattr(child, "generation", -1)
                             if child_gen != expected_gen:
-                                if isinstance(child, dict):
+                                if child_is_dict:
                                     child["generation"] = expected_gen
                                 else:
-                                    child.generation = expected_gen
+                                    try:
+                                        child.generation = expected_gen
+                                    except Exception:
+                                        pass
                                 changed = True
         
         # Group by generation
         generations = {}
         for individual in individuals:
-            gen = max(0, individual.get("generation") if isinstance(individual, dict) else individual.generation)
+            is_ind_dict = hasattr(individual, "get")
+            gen = max(0, individual.get("generation") if is_ind_dict else getattr(individual, "generation", 0))
             if gen not in generations:
                 generations[gen] = []
             generations[gen].append(individual)

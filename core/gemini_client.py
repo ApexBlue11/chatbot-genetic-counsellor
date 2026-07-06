@@ -80,7 +80,7 @@ def discover_text_models(genai) -> List[str]:
             if 'generateContent' in m.supported_generation_methods:
                 name = m.name.split('/')[-1]
                 all_discovered.append(name)
-        exclude_keywords = ['embed', 'vision', 'audio', 'video', 'bidi', 'whisper', 'imagen', 'aqa']
+        exclude_keywords = ['embed', 'vision', 'audio', 'video', 'bidi', 'whisper', 'imagen', 'aqa', 'image', 'tts', 'robotics', 'computer-use']
         gemini_models = [
             m for m in all_discovered
             if 'gemini' in m.lower() and not any(kw in m.lower() for kw in exclude_keywords)
@@ -323,31 +323,33 @@ def read_enriched_data(patient_label: str, variant_ids: str) -> str:
                 # Try case-insensitive match
                 match = next((k for k in enriched if k.lower() == vid.lower()), None)
                 results[vid] = enriched[match] if match else {"error": f"Variant '{vid}' not found in enriched data for patient '{patient_label}'"}
-
         return json.dumps(results, indent=2)
     except Exception as e:
         return f"Error reading enriched data: {str(e)}"
+
+
 # Module-level pedigree image storage to avoid passing massive base64 text back to LLM context
 _LAST_PEDIGREE_IMAGE: Optional[str] = None
 
 
-def create_pedigree_chart(family_description: str) -> str:
+def create_pedigree_chart(individuals: list, relationships: list) -> dict:
     """
-    Parse a family description and construct a medical pedigree chart showing individuals,
-    their relationships, disease status, and inheritance pattern.
+    Generate and draw a medical pedigree chart from structured family tree data.
 
-    Use this tool when:
-    - The counselor describes a family history with affected/unaffected members
-    - The user asks to draw or create a pedigree
-    - You need to visualize an inheritance pattern (autosomal recessive, dominant, X-linked, etc.)
+    Use this tool when the user describes a family history or requests a pedigree chart.
+    You must translate the described family members and their connections into the structured lists.
 
-    family_description: Free-text description of the family tree. Include:
-      - Each person's sex (male/female) and role (proband, father, mother, sibling, grandparent)
-      - Affected status (affected, carrier, unaffected)
-      - Relationship connections
-
-    Example: "The proband is an affected male. His parents are unaffected carriers.
-               He has an unaffected sister and an affected brother."
+    individuals: List of dicts representing family members. Each dict must contain:
+      - id: Unique short string identifier (e.g. "proband", "father", "mother", "sister1")
+      - name: Display name
+      - gender: Gender string, must be one of: "male", "female", "unknown"
+      - status: Disease status, must be one of: "affected", "carrier", "unaffected"
+      - deceased: Boolean flag (true if deceased, false otherwise)
+      
+    relationships: List of dicts representing connections. Each dict must contain:
+      - type: Relationship type, one of: "marriage", "parent-child", "sibling"
+      - person1: String ID of the first person
+      - person2: String ID of the second person
     """
     from analysis.pedigree_generator import PedigreeGenerator
     import base64
@@ -355,21 +357,32 @@ def create_pedigree_chart(family_description: str) -> str:
 
     try:
         generator = PedigreeGenerator(api_key=load_gemini_api_key())
-        pedigree_data = generator.parse_family_description(family_description, use_ai=True)
+        
+        # Prepare the pedigree data structure directly from the tool call arguments
+        pedigree_data = {
+            "individuals": individuals,
+            "relationships": relationships
+        }
+        
+        # Run generational sorting
+        sorted_generations = generator._organize_generations(pedigree_data)
+        pedigree_data["generations"] = sorted_generations["generations"]
+        pedigree_data["individuals"] = sorted_generations["individuals"]
+        
         png_bytes = generator.generate_png_bytes(pedigree_data)
         b64_image = base64.b64encode(png_bytes).decode('utf-8')
         
         # Save to global variable so generate_with_agent can retrieve it without bloating Gemini's context
         _LAST_PEDIGREE_IMAGE = b64_image
         
-        return json.dumps({
+        return {
             "status": "success",
             "message": f"Pedigree generated successfully with {len(pedigree_data.get('individuals', []))} individuals. The chart has been rendered and shown in the UI.",
             "pedigree_data": pedigree_data,
             "_INTERNAL_MARKER_PEDIGREE": True
-        }, indent=2)
+        }
     except Exception as e:
-        return f"Error creating pedigree chart: {str(e)}"
+        return {"status": "error", "message": f"Error creating pedigree chart: {str(e)}"}
 
 
 # Module-level conversation ID — set by handle_ai_chat before each call
@@ -450,11 +463,19 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
                                 except Exception:
                                     pass
 
+                            # Recursively convert any MapComposite/protobuf objects to raw Python structures
+                            def to_dict_clean(val):
+                                if hasattr(val, "items"):
+                                    return {k: to_dict_clean(v) for k, v in val.items()}
+                                elif isinstance(val, (list, tuple)) or (hasattr(val, "__iter__") and not isinstance(val, (str, bytes))):
+                                    return [to_dict_clean(x) for x in val]
+                                return val
+
                             from analysis.pedigree_generator import log_pedigree_step
                             if "pedigree_data" in resp_dict or resp_dict.get("status") == "success" or resp_dict.get("_INTERNAL_MARKER_PEDIGREE"):
                                 metadata = {
                                     "type": "pedigree_chart",
-                                    "pedigree_data": resp_dict.get("pedigree_data", {}),
+                                    "pedigree_data": to_dict_clean(resp_dict.get("pedigree_data", {})),
                                     "image_base64": _LAST_PEDIGREE_IMAGE
                                 }
                                 log_pedigree_step("PEDIGREE_METADATA_EXTRACT", "Successfully extracted pedigree chart metadata", {
