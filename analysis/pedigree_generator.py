@@ -585,8 +585,50 @@ class PedigreeRenderer:
                 return min(indices)
                 
             child_gen["individuals"] = sorted(child_individuals, key=child_sort_key)
-        # -------------------------------------------------------------
-        
+        # Couple-pairing sorter: ensure married partners are kept strictly adjacent
+        marriages = [r for r in relationships if r.get("type") == "marriage"]
+        spouse_of = {}
+        for m in marriages:
+            p1 = m.get("person1")
+            p2 = m.get("person2")
+            spouse_of[p1] = p2
+            spouse_of[p2] = p1
+
+        for gen_data in generations:
+            individuals = gen_data.get("individuals", [])
+            if not individuals:
+                continue
+                
+            grouped_indivs = []
+            visited = set()
+            for ind in individuals:
+                is_dict = hasattr(ind, "get")
+                ind_id = ind.get("id") if is_dict else getattr(ind, "id", None)
+                if ind_id in visited:
+                    continue
+                    
+                spouse_id = spouse_of.get(ind_id)
+                if spouse_id:
+                    spouse_obj = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == spouse_id), None)
+                    if spouse_obj:
+                        g1 = (ind.get("gender") if is_dict else getattr(ind, "gender", "")).lower()
+                        if g1 == "male":
+                            grouped_indivs.append((ind, spouse_obj))
+                        else:
+                            grouped_indivs.append((spouse_obj, ind))
+                        visited.add(ind_id)
+                        visited.add(spouse_id)
+                        continue
+                
+                grouped_indivs.append((ind,))
+                visited.add(ind_id)
+                
+            flat_individuals = []
+            for group in grouped_indivs:
+                flat_individuals.extend(group)
+            gen_data["individuals"] = flat_individuals
+
+        # Assign calculated coordinates
         for gen_data in generations:
             gen_index = gen_data.get("generation", 0)
             individuals = gen_data.get("individuals", [])
