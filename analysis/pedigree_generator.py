@@ -307,7 +307,11 @@ REQUIRED JSON STRUCTURE:
 RULES:
 1) Output ONLY raw JSON with double quotes; no markdown or prose.
 2) Use lowercase names as ids (e.g., "john").
-3) Create BOTH parent-child links for each parent to each child."""
+3) Create BOTH parent-child links for each parent to each child.
+4) Terminology Correction: A pedigree chart is drawn relative to the patient/proband. Ensure all label names match this perspective:
+   - The children of Aunt or Uncle must be labeled as "Cousin" (or similar), NOT "Niece" or "Nephew" relative to the patient.
+   - Only children of the patient's siblings can be labeled "Niece" or "Nephew".
+5) If the prompt implies a single person (e.g. "mother marries cousin... cousin is father"), merge them into a single person and use the more descriptive term for the name."""
 
         pass1_text = self.query_gemini(pass1_system, prompt)
         log_pedigree_step("PEDIGREE_PASS1_RESPONSE", "Received raw text from Pass 1", {"text": pass1_text[:200]})
@@ -585,7 +589,8 @@ class PedigreeRenderer:
                 return min(indices)
                 
             child_gen["individuals"] = sorted(child_individuals, key=child_sort_key)
-        # Couple-pairing sorter: ensure married partners are kept strictly adjacent
+        # Couple-pairing sorter: ensure married partners are kept strictly adjacent,
+        # with spouses positioned on the outer side of the sibling cluster.
         marriages = [r for r in relationships if r.get("type") == "marriage"]
         spouse_of = {}
         for m in marriages:
@@ -599,8 +604,21 @@ class PedigreeRenderer:
             if not individuals:
                 continue
                 
+            # Identify which individuals are siblings (have parents in the database)
+            siblings_in_gen = []
+            for ind in individuals:
+                is_dict = hasattr(ind, "get")
+                ind_id = ind.get("id") if is_dict else getattr(ind, "id", None)
+                parents = child_to_parents.get(ind_id, [])
+                if parents:
+                    siblings_in_gen.append(ind_id)
+            
+            # Map each sibling ID to its index in the current sorted sibling list
+            sibling_index_map = {sid: idx for idx, sid in enumerate(siblings_in_gen)}
+            
             grouped_indivs = []
             visited = set()
+            
             for ind in individuals:
                 is_dict = hasattr(ind, "get")
                 ind_id = ind.get("id") if is_dict else getattr(ind, "id", None)
@@ -611,11 +629,34 @@ class PedigreeRenderer:
                 if spouse_id:
                     spouse_obj = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == spouse_id), None)
                     if spouse_obj:
-                        g1 = (ind.get("gender") if is_dict else getattr(ind, "gender", "")).lower()
-                        if g1 == "male":
-                            grouped_indivs.append((ind, spouse_obj))
+                        # Determine sibling status
+                        ind_is_sibling = ind_id in sibling_index_map
+                        spouse_is_sibling = spouse_id in sibling_index_map
+                        
+                        if ind_is_sibling and not spouse_is_sibling:
+                            # Sibling is ind, Spouse is in-law
+                            sib_idx = sibling_index_map[ind_id]
+                            # If sibling is on the left half of the sibling group, put spouse on left
+                            if len(siblings_in_gen) > 1 and sib_idx < len(siblings_in_gen) / 2:
+                                grouped_indivs.append((spouse_obj, ind))
+                            else:
+                                grouped_indivs.append((ind, spouse_obj))
+                        elif not ind_is_sibling and spouse_is_sibling:
+                            # Sibling is spouse_obj, Spouse is in-law (ind)
+                            sib_idx = sibling_index_map[spouse_id]
+                            # If sibling is on the left half of the sibling group, put spouse on left
+                            if len(siblings_in_gen) > 1 and sib_idx < len(siblings_in_gen) / 2:
+                                grouped_indivs.append((ind, spouse_obj))
+                            else:
+                                grouped_indivs.append((spouse_obj, ind))
                         else:
-                            grouped_indivs.append((spouse_obj, ind))
+                            # Both are siblings or both are in-laws, sort by male on left
+                            g1 = (ind.get("gender") if is_dict else getattr(ind, "gender", "")).lower()
+                            if g1 == "male":
+                                grouped_indivs.append((ind, spouse_obj))
+                            else:
+                                grouped_indivs.append((spouse_obj, ind))
+                                
                         visited.add(ind_id)
                         visited.add(spouse_id)
                         continue
