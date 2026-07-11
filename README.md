@@ -1,10 +1,10 @@
-# VariantMind: Intelligent Variant Curation & Pedigree Workbench
+# VariantMind
+
+> **Intelligent variant curation and pedigree chart generation workbench for genetic counselors, clinical geneticists, and researchers.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Live Application**: [https://variantmind.netlify.app/](https://variantmind.netlify.app/)
-
-VariantMind is a production-grade web application for genetic counselors, clinical geneticists, and researchers. It features AI-assisted variant interpretation, batch VCF processing with differential prompting context, multi-patient session management, and pedigree chart generation.
-
-The application is structured as a **FastAPI backend** and a modern **React (Vite) frontend**.
 
 ---
 
