@@ -702,3 +702,65 @@ input, textarea {
       0 0 6px 1.8px rgba(156, 163, 175, 0.2);
   }
 }
+
+/* ── Backend connection indicator ──────────────────────────────────────────
+   The demo backend idles when unused and can take up to a minute to wake, so
+   a visitor otherwise has no way to tell "still starting" from "broken". */
+.conn-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.conn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+}
+
+.conn-dot--pulse {
+  animation: conn-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes conn-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.82); }
+}
+
+.conn-status--amber { color: #fbbf24; }
+.conn-status--green { color: #34d399; }
+.conn-status--red   { color: #f87171; }
+
+.conn-status .conn-label { color: var(--text-sidebar-muted); }
+.conn-status--amber .conn-label { color: #fcd34d; }
+.conn-status--red .conn-label { color: #fca5a5; }
+
+.conn-retry {
+  margin-left: 0.15rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(248, 113, 113, 0.16);
+  color: #fecaca;
+  font-size: 0.62rem;
+  font-weight: 600;
+}
+
+.conn-retry:hover { background: rgba(248, 113, 113, 0.3); }
+
+/* Landing-page pill sits on the dark gradient rather than in the sidebar. */
+.conn-status--pill {
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(2, 6, 23, 0.6);
+  backdrop-filter: blur(8px);
+  font-size: 0.7rem;
+}
+
+.conn-status--pill .conn-label { color: #cbd5e1; }

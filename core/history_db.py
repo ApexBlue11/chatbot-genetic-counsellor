@@ -8,10 +8,17 @@ from typing import List, Dict, Any, Optional
 class BaseHistoryDB:
     """Abstract interface for swappable database memory adapters."""
 
-    def create_conversation(self, title: str = "New Conversation") -> str:
+    def create_conversation(self, title: str = "New Conversation",
+                            session_id: str = "") -> str:
         raise NotImplementedError
 
-    def list_conversations(self) -> List[Dict[str, Any]]:
+    def list_conversations(self, session_id: str = "") -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def owns_conversation(self, conversation_id: str, session_id: str) -> bool:
+        raise NotImplementedError
+
+    def purge_older_than(self, max_age_seconds: float) -> int:
         raise NotImplementedError
 
     def rename_conversation(self, conversation_id: str, title: str) -> None:
@@ -68,9 +75,23 @@ class SQLiteHistoryDB(BaseHistoryDB):
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT ''
                 )
             """)
+            # Conversations are scoped to an anonymous browser session. Without
+            # this, every visitor to a shared demo link saw — and could delete —
+            # every other visitor's chats and uploaded VCFs.
+            cursor.execute("PRAGMA table_info(conversations)")
+            conv_cols = [info[1] for info in cursor.fetchall()]
+            if "session_id" not in conv_cols:
+                cursor.execute(
+                    "ALTER TABLE conversations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+                )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_session "
+                "ON conversations(session_id, updated_at DESC)"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,25 +130,52 @@ class SQLiteHistoryDB(BaseHistoryDB):
 
     # ── Conversations ──
 
-    def create_conversation(self, title: str = "New Conversation") -> str:
+    def create_conversation(self, title: str = "New Conversation",
+                            session_id: str = "") -> str:
         import uuid
         conv_id = str(uuid.uuid4())[:12]
         now = time.time()
         self._execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (conv_id, title, now, now),
+            "INSERT INTO conversations (id, title, created_at, updated_at, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (conv_id, title, now, now, session_id),
         )
         return conv_id
 
-    def list_conversations(self) -> List[Dict[str, Any]]:
+    def owns_conversation(self, conversation_id: str, session_id: str) -> bool:
+        """Whether this session may read or modify the conversation."""
         rows = self._execute(
-            "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC",
+            "SELECT 1 FROM conversations WHERE id = ? AND session_id = ?",
+            (conversation_id, session_id),
+            fetch=True,
+        )
+        return bool(rows)
+
+    def list_conversations(self, session_id: str = "") -> List[Dict[str, Any]]:
+        rows = self._execute(
+            "SELECT id, title, created_at, updated_at FROM conversations "
+            "WHERE session_id = ? ORDER BY updated_at DESC",
+            (session_id,),
             fetch=True,
         )
         return [
             {"id": r[0], "title": r[1], "created_at": r[2], "updated_at": r[3]}
             for r in rows
         ]
+
+    def purge_older_than(self, max_age_seconds: float) -> int:
+        """Delete conversations untouched for longer than max_age_seconds.
+
+        Demo deployments accumulate abandoned sessions; this keeps the database
+        bounded and limits how long uploaded genomic data sits on disk.
+        """
+        cutoff = time.time() - max_age_seconds
+        stale = self._execute(
+            "SELECT id FROM conversations WHERE updated_at < ?", (cutoff,), fetch=True
+        )
+        for (conv_id,) in stale:
+            self.delete_conversation(conv_id)
+        return len(stale)
 
     def rename_conversation(self, conversation_id: str, title: str) -> None:
         self._execute(

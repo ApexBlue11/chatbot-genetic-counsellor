@@ -3,6 +3,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowRight, BookOpen, Dna, GitBranch, ShieldCheck, Sparkles } from 'lucide-react';
 import { BASES } from './dna-bases';
+import ConnectionStatus from '../ConnectionStatus';
 import type { AnchorScreen } from './dna-scene';
 import { cn } from '@/lib/utils';
 
@@ -23,8 +24,15 @@ import { cn } from '@/lib/utils';
  * three surfaces read as one product.
  */
 
+interface BackendStatus {
+  status: string;
+  isOnline: boolean;
+  retry: () => void;
+}
+
 interface WelcomePageProps {
   onLaunch: () => void;
+  backend?: BackendStatus;
 }
 
 // three.js is ~235 kB gzipped; it loads only for this page, never for the
@@ -62,7 +70,7 @@ const FEATURES = [
 const CARD_OFFSET = { x: 54, y: 34 };
 const CARD_WIDTH = 340;
 
-export default function WelcomePage({ onLaunch }: WelcomePageProps) {
+export default function WelcomePage({ onLaunch, backend }: WelcomePageProps) {
   const progressRef = useRef(0);
   const anchorsRef = useRef<AnchorScreen[]>(
     FEATURES.map(() => ({ x: 0, y: 0, strength: 0, visible: false }))
@@ -209,8 +217,20 @@ export default function WelcomePage({ onLaunch }: WelcomePageProps) {
               Launch workspace
               <ArrowRight className="h-4 w-4" />
             </button>
+            {/* Shown up front: the demo backend sleeps, and a visitor reading
+                the intro is exactly who is waiting for it to wake. */}
+            {backend && (
+              <div className="mt-8">
+                <ConnectionStatus
+                  status={backend.status}
+                  onRetry={backend.retry}
+                  variant="pill"
+                />
+              </div>
+            )}
+
             <div
-              className="mt-14 flex flex-col items-center gap-2 text-[11px] uppercase tracking-[0.25em] text-slate-300"
+              className="mt-10 flex flex-col items-center gap-2 text-[11px] uppercase tracking-[0.25em] text-slate-300"
               style={{ textShadow: '0 1px 12px rgba(2,6,23,0.95)' }}
             >
               Scroll along the molecule

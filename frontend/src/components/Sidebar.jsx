@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { MessageSquare, Plus, Trash2, Edit2, Check, X, Dna } from 'lucide-react';
+import ConnectionStatus from './ConnectionStatus';
 
-function Sidebar({ conversations, activeConversation, onSelect, onNewChat, onDelete, onRename, onGoHome, busy = false }) {
+function Sidebar({ conversations, activeConversation, onSelect, onNewChat, onDelete, onRename, onGoHome, busy = false, backend }) {
   const [editingId, setEditingId] = useState(null);
   const [editTitle, setEditTitle] = useState('');
 
@@ -38,7 +39,12 @@ function Sidebar({ conversations, activeConversation, onSelect, onNewChat, onDel
           </span>
         </button>
 
-        <button className="new-chat-btn" onClick={onNewChat} disabled={busy}>
+        <button
+          className="new-chat-btn"
+          onClick={onNewChat}
+          disabled={busy || (backend && !backend.isOnline)}
+          title={backend && !backend.isOnline ? 'Waiting for the analysis server to wake up' : undefined}
+        >
           <Plus size={16} /> {busy ? 'Starting…' : 'New Conversation'}
         </button>
       </div>
@@ -111,10 +117,14 @@ function Sidebar({ conversations, activeConversation, onSelect, onNewChat, onDel
 
       <div className="sidebar-footer">
         <span>{conversations.length} conversation{conversations.length === 1 ? '' : 's'}</span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-          <span className="sidebar-footer-dot" />
-          Research use
-        </span>
+        {backend ? (
+          <ConnectionStatus status={backend.status} onRetry={backend.retry} />
+        ) : (
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+            <span className="sidebar-footer-dot" />
+            Research use
+          </span>
+        )}
       </div>
     </div>
   );

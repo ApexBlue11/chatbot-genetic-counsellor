@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from core.history_db import SQLiteHistoryDB
+from core.session import require_session, verify_owns
 from core.query_router import GenomicQueryRouter
 from core.gemini_client import (
     init_gemini, detect_rsid, detect_hgvs,
@@ -33,7 +34,10 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/")
-def send_message(req: ChatRequest):
+def send_message(req: ChatRequest, session_id: str = Depends(require_session)):
+    # The conversation id arrives in the body, so it must be checked against
+    # the caller's session before any history is read or written.
+    verify_owns(db, req.conversation_id, session_id)
     conversation_id = req.conversation_id
     user_input = req.get_user_input()
 
@@ -43,7 +47,7 @@ def send_message(req: ChatRequest):
     db.save_message(conversation_id, "user", user_input)
 
     # Auto-title on first user message
-    convs = db.list_conversations()
+    convs = db.list_conversations(session_id)
     for c in convs:
         if c["id"] == conversation_id and c["title"] == "New Conversation":
             title = user_input[:40].strip()

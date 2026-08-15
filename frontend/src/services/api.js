@@ -1,6 +1,30 @@
 const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '') + '/api';
 
 /**
+ * Anonymous per-browser session id.
+ *
+ * The backend has no accounts and the demo is one shared link over one
+ * database, so without this every visitor saw and could delete every other
+ * visitor's conversations and uploaded VCFs. Kept in localStorage so a reload
+ * does not orphan your own chats.
+ */
+const SESSION_KEY = 'vm_session_id';
+
+export function getSessionId() {
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id) {
+    id = (crypto.randomUUID?.() ?? `s-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+      .replace(/[^A-Za-z0-9_-]/g, '');
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
+}
+
+function withSession(options = {}) {
+  return { ...options, headers: { ...(options.headers || {}), 'X-Session-Id': getSessionId() } };
+}
+
+/**
  * Every response was previously passed straight to res.json() without checking
  * res.ok, so a 500 resolved to an error body that callers treated as a real
  * record (a conversation with id: undefined), and a dead backend surfaced only
@@ -9,9 +33,11 @@ const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').repla
 async function request(path, options = {}) {
   let res;
   try {
-    res = await fetch(`${API_BASE}${path}`, options);
+    res = await fetch(`${API_BASE}${path}`, withSession(options));
   } catch {
-    throw new Error("Can't reach the VariantMind backend. Is it running on port 8000?");
+    throw new Error(
+      'Cannot reach the VariantMind backend. It may still be waking up — this can take up to a minute on a free host.'
+    );
   }
 
   if (!res.ok) {
@@ -78,6 +104,26 @@ const api = {
   },
 
   getVariantDetails: (variantId) => request(`/chat/variant/${variantId}`),
+
+  /**
+   * Health probe used by the connection indicator.
+   *
+   * Free hosts idle their containers, so the first request after a quiet spell
+   * can take the better part of a minute. Resolves to true/false rather than
+   * throwing, since callers only poll it.
+   */
+  ping: async (timeoutMs = 8000) => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${API_BASE}/health`, { signal: abort.signal });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
 };
 
 export default api;

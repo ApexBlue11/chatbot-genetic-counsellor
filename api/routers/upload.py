@@ -1,6 +1,7 @@
 import json
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from core.history_db import SQLiteHistoryDB
+from core.session import require_session, verify_owns
 from analysis.vcf_parser import VCFParser
 from analysis.vcf_prioritizer import VCFPrioritizer, DEEP_CONTEXT_LIMIT
 
@@ -48,10 +49,13 @@ def _count_conversation_variants(conversation_id: str) -> int:
 @router.post("/")
 async def upload_vcf(
     conversation_id: str = Form(...),
+    session_id: str = Depends(require_session),
     patient_label: str = Form(default=""),
     file: UploadFile = File(...),
 ):
     try:
+        verify_owns(db, conversation_id, session_id)
+
         # ── Guard: max 3 VCF files per conversation ──
         vcf_count = db.count_vcf_files(conversation_id)
         if vcf_count >= 3:
@@ -117,7 +121,7 @@ async def upload_vcf(
         db.save_message(conversation_id, "assistant", summary, metadata=meta)
 
         # Auto-title conversation
-        convs = db.list_conversations()
+        convs = db.list_conversations(session_id)
         for c in convs:
             if c["id"] == conversation_id and c["title"] == "New Conversation":
                 db.rename_conversation(conversation_id, f"VCF: {label} — {file.filename}")
