@@ -35,13 +35,21 @@ chatbot-genetic-counsellor/
 │   ├── gemini_client.py       # Google Gemini agent configuration & 5 tool schemas
 │   ├── history_db.py          # SQLite database wrapper for persistent chat & VCF tracking
 │   └── query_router.py        # Regex classifier for HGVS, rsID, and genes
-├── analysis/                  # Variant Processing & Prioritization
+├── analysis/                  # Variant Processing & Pedigree Engine
 │   ├── vcf_parser.py          # Robust VCF parser (QUAL checks & chr prefix stripping)
 │   ├── vcf_prioritizer.py     # Variant prioritizer, gene cluster analyser, and data enricher
-│   └── variant_analyser.py    # Single variant analysis orchestrator
+│   ├── variant_analyser.py    # Single variant analysis orchestrator
+│   ├── pedigree_generator.py  # Orchestrator: extraction → layout → validation → SVG
+│   ├── pedigree_layout.py     # Generation solver, ordering, x-placement, edge routing
+│   ├── pedigree_svg.py        # Clinical-notation SVG renderer
+│   ├── pedigree_validator.py  # Geometric correctness checks
+│   └── pedigree_logging.py    # Structured JSONL tracing per render
 ├── tests/                     # Developer Testing Suite
 │   ├── test_integration_v2.py # Comprehensive 38-check integration & scenario suite
 │   ├── test_qa_full.py        # 26-check unit & regression test suite
+│   ├── test_pedigree_layout.py# 15 pedigree fixtures, offline and deterministic
+│   ├── test_pedigree_live.py  # Live natural-language → Gemini → SVG check
+│   ├── svg_preview.py         # Rasterises pedigree SVGs for visual review
 │   └── test_all_input_types.py# Regex query router tests
 └── data/                      # Demo Clinical Datasets
     ├── demo_500_variants.vcf  # Large VCF for batching limits validation
@@ -115,29 +123,49 @@ VariantMind's LLM agent is equipped with five tools to gather live literature an
 4. `search_pubmed`: Perform targeted search queries for literature.
 5. `create_pedigree_chart`: Generate pedigree metadata to render family histories.
 
-### 4. Single-Call Pedigree Engine & Sorter
-VariantMind features a single-call pedigree rendering pipeline that accepts family lineage inputs from the LLM agent and renders them as standard medical charts:
-* **Topological Layout Sorter**: To prevent crossing connection lines, the rendering engine walks the pedigree tree bottom-up (from children to grandparents) and sorts spouses side-by-side (Father on left, Mother on right). This places Paternal lineages cleanly on the left side of the chart and Maternal lineages on the right side of the chart.
-* **Smart Name Label Wrapping**: Name labels are wrapped onto multiple lines if they exceed 12 characters, avoiding overlapping text fields.
-* **Clinical Genetic Standards**: Supports standard clinical symbols:
-  - Squares for males, circles for females, diamonds for unknown gender.
-  - Filled symbols for affected individuals, center dot overlays for carriers, and diagonal lines for deceased status.
-  - A question mark (`?`) symbol centered inside the shape for individuals with **unknown disease status**.
+### 4. Deterministic Pedigree Engine (SVG)
+Pedigrees are rendered as scalable vector charts. The LLM's only job is to extract *who exists and how they are related*; every layout decision is computed deterministically and then checked geometrically before the chart is returned. See [docs/pedigree_system.md](docs/pedigree_system.md) for the full architecture.
+
+* **Generation solver**: BFS across every connected component, so a relative the model failed to link cannot float onto the wrong row. Contradictory constraints are reported rather than silently applied.
+* **Crossing-reduced ordering**: median-heuristic sweeps, with couples held together as rigid blocks and married-in spouses pushed to the outer edge so blood siblings stay adjacent.
+* **Barycentre placement**: children are centred under their parents, with minimum spacing enforced by an exact isotonic projection.
+* **Sibship routing**: children hang from a shared sibship bus rather than individual elbows; buses in the same generation gap are interval-coloured onto separate levels so they can never overlap. Consanguineous unions are drawn with a double bar.
+* **Content-sized canvas**: each chart is sized to fit, instead of a fixed canvas that left half the image blank.
+* **Clinical standards**: squares/circles/diamonds for male/female/unknown sex; filled for affected, centre dot for carrier, `?` for unknown status, diagonal slash for deceased, and an arrow marking the single proband. Every chart carries a legend.
+
+### 5. Geometric Validation
+`analysis/pedigree_validator.py` checks the resolved geometry directly — not a rendered image — so correctness is machine-verifiable. It fails on overlapping symbols, connectors drawn through shapes or name labels, duplicated lines, broken generation relationships, a couple split by a third person, or more than one proband; and warns on connector crossings, off-centre children and disconnected branches.
 
 ---
 
 ## 🧪 Running Developer Test Suites
 
-VariantMind has two developer test suites to prevent regressions and verify API contracts:
+### 1. Pedigree Layout Suite (`test_pedigree_layout.py`)
+The inner loop for pedigree work — offline, deterministic, ~40 ms. Runs 15 fixtures through layout → geometric validation → SVG and fails on any validator error, so chart correctness never depends on someone eyeballing an image.
+```bash
+python tests/test_pedigree_layout.py
+python tests/test_pedigree_layout.py nuclear_ar   # one fixture
+python tests/svg_preview.py                       # rasterise for review
+```
 
-### 1. Unit & Regression Tests (`test_qa_full.py`)
+Only `test_pedigree_live.py` touches the network; it runs the full natural-language pipeline against Gemini and is meant to be run deliberately, not on every edit:
+```bash
+python tests/test_pedigree_live.py
+```
+
+The landing page's scroll choreography has an equivalent offline check:
+```bash
+node frontend/scripts/verify-dna-choreography.mjs
+```
+
+### 2. Unit & Regression Tests (`test_qa_full.py`)
 Runs 26 checks validating individual modules like VCF parsers, API endpoints, dbNSFP parsing, VEP batch chunking, and SQLite history tracking.
 ```bash
 $env:PYTHONPATH="."
 python tests/test_qa_full.py
 ```
 
-### 2. End-to-End & Integration Tests (`test_integration_v2.py`)
+### 3. End-to-End & Integration Tests (`test_integration_v2.py`)
 Runs 38 checks testing frontend-backend contracts, patient isolation, pedigree triggers, and simulated clinical scenarios:
 * **Scenario A (Family Trio)**: Simulates uploading Proband, Sibling, and Mother files, verifying that the AI isolates patients and maps variant classifications correctly.
 * **Scenario B (Researcher Search)**: Verifies variant routing triggers without context leaks.

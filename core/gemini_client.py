@@ -328,8 +328,9 @@ def read_enriched_data(patient_label: str, variant_ids: str) -> str:
         return f"Error reading enriched data: {str(e)}"
 
 
-# Module-level pedigree image storage to avoid passing massive base64 text back to LLM context
-_LAST_PEDIGREE_IMAGE: Optional[str] = None
+# Module-level pedigree storage, so the SVG never has to travel back through the
+# LLM's context window.
+_LAST_PEDIGREE_SVG: Optional[str] = None
 
 
 def create_pedigree_chart(individuals: list, relationships: list) -> dict:
@@ -352,36 +353,74 @@ def create_pedigree_chart(individuals: list, relationships: list) -> dict:
       - person2: String ID of the second person
     """
     from analysis.pedigree_generator import PedigreeGenerator
-    import base64
-    global _LAST_PEDIGREE_IMAGE
+    from analysis.pedigree_logging import PedigreeTrace
+    global _LAST_PEDIGREE_SVG
 
+    trace = PedigreeTrace("tool-call")
     try:
         generator = PedigreeGenerator(api_key=load_gemini_api_key())
-        
-        # Prepare the pedigree data structure directly from the tool call arguments
+
+        # Normalize protobuf RepeatedComposite objects to standard Python lists of dicts
+        python_individuals = []
+        for ind in individuals:
+            if hasattr(ind, "to_dict"):
+                python_individuals.append(ind.to_dict())
+            elif hasattr(ind, "items"):
+                python_individuals.append(dict(ind.items()))
+            else:
+                try:
+                    python_individuals.append(dict(ind))
+                except Exception:
+                    d = {}
+                    for field in ["id", "name", "gender", "status", "deceased", "generation", "conditions", "age"]:
+                        if hasattr(ind, field):
+                            d[field] = getattr(ind, field)
+                    python_individuals.append(d)
+
+        python_relationships = []
+        for rel in relationships:
+            if hasattr(rel, "to_dict"):
+                python_relationships.append(rel.to_dict())
+            elif hasattr(rel, "items"):
+                python_relationships.append(dict(rel.items()))
+            else:
+                try:
+                    python_relationships.append(dict(rel))
+                except Exception:
+                    d = {}
+                    for field in ["type", "person1", "person2"]:
+                        if hasattr(rel, field):
+                            d[field] = getattr(rel, field)
+                    python_relationships.append(d)
+
         pedigree_data = {
-            "individuals": individuals,
-            "relationships": relationships
+            "individuals": python_individuals,
+            "relationships": python_relationships,
         }
-        
-        # Run generational sorting
-        sorted_generations = generator._organize_generations(pedigree_data)
-        pedigree_data["generations"] = sorted_generations["generations"]
-        pedigree_data["individuals"] = sorted_generations["individuals"]
-        
-        png_bytes = generator.generate_png_bytes(pedigree_data)
-        b64_image = base64.b64encode(png_bytes).decode('utf-8')
-        
-        # Save to global variable so generate_with_agent can retrieve it without bloating Gemini's context
-        _LAST_PEDIGREE_IMAGE = b64_image
-        
+        trace.dump_artifact("tool_input.json", pedigree_data)
+
+        # Generation levels, ordering and routing are all computed inside the
+        # layout engine — the model only supplies who exists and how they relate.
+        layout = generator.build_layout(pedigree_data, trace)
+        _LAST_PEDIGREE_SVG = generator.generate_svg(pedigree_data, trace=trace)
+
+        pedigree_data["generations"] = [
+            {"generation": gen, "individuals": members}
+            for gen, members in sorted(layout.generations.items())
+        ]
+
+        summary = trace.finish()
         return {
             "status": "success",
-            "message": f"Pedigree generated successfully with {len(pedigree_data.get('individuals', []))} individuals. The chart has been rendered and shown in the UI.",
+            "message": (f"Pedigree rendered with {len(layout.nodes)} individuals across "
+                        f"{len(layout.generations)} generations. The chart is shown in the UI."),
             "pedigree_data": pedigree_data,
-            "_INTERNAL_MARKER_PEDIGREE": True
+            "warnings": summary.get("warnings", [])[:5],
+            "_INTERNAL_MARKER_PEDIGREE": True,
         }
     except Exception as e:
+        trace.error("tool", f"Pedigree generation failed: {e}")
+        trace.finish()
         return {"status": "error", "message": f"Error creating pedigree chart: {str(e)}"}
 
 
@@ -404,8 +443,8 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
     models = discover_text_models(genai)
     last_error = None
     
-    global _LAST_PEDIGREE_IMAGE
-    _LAST_PEDIGREE_IMAGE = None
+    global _LAST_PEDIGREE_SVG
+    _LAST_PEDIGREE_SVG = None
 
     tools = [
         search_pubmed,
@@ -476,10 +515,11 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
                                 metadata = {
                                     "type": "pedigree_chart",
                                     "pedigree_data": to_dict_clean(resp_dict.get("pedigree_data", {})),
-                                    "image_base64": _LAST_PEDIGREE_IMAGE
+                                    "svg": _LAST_PEDIGREE_SVG,
                                 }
                                 log_pedigree_step("PEDIGREE_METADATA_EXTRACT", "Successfully extracted pedigree chart metadata", {
-                                    "has_image": bool(metadata["image_base64"]),
+                                    "has_svg": bool(metadata["svg"]),
+                                    "svg_bytes": len(metadata["svg"] or ""),
                                     "individuals_count": len(metadata["pedigree_data"].get("individuals", []))
                                 })
                         except Exception as ex:

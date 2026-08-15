@@ -1,33 +1,43 @@
 """
-Complete Pedigree Tree Generator in Python
-Replicates the JavaScript functionality with Python/PIL rendering
+Pedigree generation: free-text family history in, SVG chart out.
+
+The model's only job is to extract *who exists* and *how they are related*.
+Everything downstream of that — generation levels, left-to-right ordering,
+spouse placement, connector routing and canvas sizing — is computed
+deterministically by :mod:`analysis.pedigree_layout`, and the geometry is
+machine-checked by :mod:`analysis.pedigree_validator`.
+
+    Free-text family description
+               ↓
+      Gemini (relationship extraction only)
+               ↓
+      {individuals, relationships}
+               ↓
+      compute_layout  →  validate_layout  →  render_svg
 """
 
-import os
 import json
+import os
 import re
-import requests
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
-from PIL import Image, ImageDraw, ImageFont
-import io
-import sys
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
-def log_pedigree_step(step_name: str, message: str, details: Any = None):
-    """Structured console logger for tracing pedigree inputs, processing, and rendering steps."""
-    timestamp = os.environ.get("CURRENT_TIME_STAMP", "LOG")
-    detail_str = f" | Details: {json.dumps(details)}" if details is not None else ""
-    print(f"[{timestamp}] [{step_name}] {message}{detail_str}", flush=True)
+import requests
+
+from analysis.pedigree_layout import PedigreeLayout, compute_layout
+from analysis.pedigree_logging import PedigreeTrace, log_pedigree_step  # noqa: F401
+from analysis.pedigree_svg import render_svg
+from analysis.pedigree_validator import validate_layout
 
 
 @dataclass
 class Individual:
-    """Represents an individual in the pedigree"""
+    """Represents an individual in the pedigree."""
     id: str
     name: str
-    gender: str  # 'male', 'female', 'unknown'
+    gender: str                 # 'male' | 'female' | 'unknown'
     age: Optional[int]
-    status: str  # 'unaffected', 'affected', 'carrier', 'deceased'
+    status: str                 # 'unaffected' | 'affected' | 'carrier' | 'unknown'
     conditions: List[str]
     deceased: bool
     generation: int
@@ -35,1006 +45,288 @@ class Individual:
 
 @dataclass
 class Relationship:
-    """Represents a relationship between individuals"""
-    type: str  # 'marriage', 'parent-child', 'sibling'
+    """Represents a relationship between two individuals."""
+    type: str                   # 'marriage' | 'parent-child' | 'sibling'
     person1: str
     person2: str
 
 
 class SimplePedigreeParser:
-    """Regex-based parser for family descriptions (Python equivalent of JS version)"""
-    
+    """Regex fallback for when the model is unreachable.
+
+    Handles the common shorthand a counselor types — ``David (40 M, carrier)``
+    and ``Sarah is a 34-year-old female`` — well enough to draw something
+    useful. Generation levels are left to the layout engine.
+    """
+
     def parse(self, text: str) -> Dict[str, Any]:
-        """Parse natural language text into pedigree data structure"""
-        individuals = []
-        relationships = []
-        
-        # Extract individuals using patterns
+        individuals: List[Individual] = []
+        relationships: List[Relationship] = []
         self.extract_individuals(text, individuals)
-        
-        # Extract relationships
         self.extract_relationships(text, individuals, relationships)
-        
-        # Organize generations properly
-        self.organize_generations(individuals, relationships)
-        
-        # Group by generation
-        gen_map = {}
-        for individual in individuals:
-            gen = individual.generation
-            if gen not in gen_map:
-                gen_map[gen] = []
-            gen_map[gen].append(individual)
-        
-        generations = [
-            {"generation": gen, "individuals": [asdict(ind) for ind in indivs]}
-            for gen, indivs in sorted(gen_map.items())
-        ]
-        
         return {
-            "individuals": [asdict(ind) for ind in individuals],
-            "relationships": [asdict(rel) for rel in relationships],
-            "generations": generations
+            "individuals": [asdict(i) for i in individuals],
+            "relationships": [asdict(r) for r in relationships],
         }
-    
-    def extract_individuals(self, text: str, individuals: List[Individual]):
-        """Extract individuals from text using multiple patterns"""
-        # Pattern 1: "David (40 M, carrier)" or "David (40, M, carrier)"
-        pattern1 = r'(\w+)\s*\((\d+)[\s,]*([MF]|male|female|M|F)[\s,]*(carrier|affected|unaffected|deceased)?\)'
-        for match in re.finditer(pattern1, text, re.IGNORECASE):
-            name = match.group(1)
-            age = int(match.group(2))
-            gender = self.normalize_gender(match.group(3))
-            status = match.group(4).lower() if match.group(4) else 'unaffected'
-            
+
+    def extract_individuals(self, text: str, individuals: List[Individual]) -> None:
+        seen = set()
+
+        def add(name, age, gender, status, generation=0):
+            key = name.lower()
+            if key in seen:
+                return
+            seen.add(key)
             individuals.append(Individual(
-                id=name.lower(),
-                name=name,
-                gender=gender,
-                age=age,
-                status=status,
-                conditions=[],
-                deceased=(status == 'deceased'),
-                generation=0
+                id=key, name=name, gender=self.normalize_gender(gender),
+                age=int(age) if age else None,
+                status=(status or "unaffected").lower(),
+                conditions=[], deceased=(status or "").lower() == "deceased",
+                generation=generation,
             ))
-        
-        # Pattern 2: "John is a 45-year-old male"
-        pattern2 = r'(\w+)\s+is\s+a(?:n)?\s+(\d+)[-\s]year[-\s]old\s+(male|female)'
-        for match in re.finditer(pattern2, text, re.IGNORECASE):
-            name = match.group(1)
-            age = int(match.group(2))
-            gender = match.group(3).lower()
-            
-            # Check if already added
-            if not any(i.name == name for i in individuals):
-                individuals.append(Individual(
-                    id=name.lower(),
-                    name=name,
-                    gender=gender,
-                    age=age,
-                    status='unaffected',
-                    conditions=[],
-                    deceased=False,
-                    generation=0
-                ))
-        
-        # Pattern 3: Children mentioned in various formats
-        children_patterns = [
-            r'children\s*[—\-:]\s*([^.]+)',
-            r'have\s+(?:children|a\s+child|two\s+children|three\s+children|four\s+children|five\s+children)[—\-:\s]*([^.]+)',
-            r'(?:son|daughter|child)(?:ren)?\s*[—\-:]\s*([^.]+)'
-        ]
-        
-        for pattern in children_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                children_text = match.group(1)
-                child_pattern = r'(\w+)\s*\((\d+)[\s,]*([MF]|male|female)[\s,]*(carrier|affected|unaffected|deceased)?\)'
-                for child_match in re.finditer(child_pattern, children_text, re.IGNORECASE):
-                    name = child_match.group(1)
-                    age = int(child_match.group(2))
-                    gender = self.normalize_gender(child_match.group(3))
-                    status = child_match.group(4).lower() if child_match.group(4) else 'unaffected'
-                    
-                    # Don't add duplicates
-                    if not any(i.name == name for i in individuals):
-                        individuals.append(Individual(
-                            id=name.lower(),
-                            name=name,
-                            gender=gender,
-                            age=age,
-                            status=status,
-                            conditions=[],
-                            deceased=(status == 'deceased'),
-                            generation=1
-                        ))
-    
-    def extract_relationships(self, text: str, individuals: List[Individual], relationships: List[Relationship]):
-        """Extract relationships between individuals"""
-        # Find parents (generation 0) and children (generation 1)
+
+        # "David (40 M, carrier)" / "David (40, male, affected)"
+        pattern = (r'(\w+)\s*\((\d+)[\s,]*([MF]|male|female)[\s,]*'
+                   r'(carrier|affected|unaffected|deceased)?\)')
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            add(match.group(1), match.group(2), match.group(3), match.group(4))
+
+        # "John is a 45-year-old male"
+        for match in re.finditer(
+                r'(\w+)\s+is\s+an?\s+(\d+)[-\s]year[-\s]old\s+(male|female)',
+                text, re.IGNORECASE):
+            add(match.group(1), match.group(2), match.group(3), None)
+
+        # Children listed after a "children — ..." style lead-in.
+        for lead in (r'children\s*[—\-:]\s*([^.]+)',
+                     r'(?:son|daughter|child)(?:ren)?\s*[—\-:]\s*([^.]+)'):
+            for match in re.finditer(lead, text, re.IGNORECASE):
+                for child in re.finditer(pattern, match.group(1), re.IGNORECASE):
+                    add(child.group(1), child.group(2), child.group(3),
+                        child.group(4), generation=1)
+
+    def extract_relationships(self, text: str, individuals: List[Individual],
+                              relationships: List[Relationship]) -> None:
         parents = [i for i in individuals if i.generation == 0]
         children = [i for i in individuals if i.generation == 1]
-        
-        # Look for marriage patterns: "Alex and Beth" or "Alex (30 M, affected) and Beth (28 F, carrier)"
-        marriage_pattern = r'(\w+)\s*\([^)]+\)\s+and\s+(\w+)\s*\([^)]+\)'
-        marriage_match = re.search(marriage_pattern, text, re.IGNORECASE)
-        
-        if marriage_match:
-            spouse1 = marriage_match.group(1)
-            spouse2 = marriage_match.group(2)
-            
-            person1 = next((i for i in individuals if i.name == spouse1), None)
-            person2 = next((i for i in individuals if i.name == spouse2), None)
-            
-            if person1 and person2:
-                relationships.append(Relationship(
-                    type="marriage",
-                    person1=person1.id,
-                    person2=person2.id
-                ))
-        elif len(parents) == 2:
-            # Fallback: assume first two generation 0 individuals are married
-            relationships.append(Relationship(
-                type="marriage",
-                person1=parents[0].id,
-                person2=parents[1].id
-            ))
-        
-        # Add parent-child relationships for all parents to all children
+
+        match = re.search(r'(\w+)\s*\([^)]+\)\s+and\s+(\w+)\s*\([^)]+\)', text, re.IGNORECASE)
+        spouses = None
+        if match:
+            a = next((i for i in individuals if i.name.lower() == match.group(1).lower()), None)
+            b = next((i for i in individuals if i.name.lower() == match.group(2).lower()), None)
+            if a and b:
+                spouses = (a, b)
+        if spouses is None and len(parents) == 2:
+            spouses = (parents[0], parents[1])
+        if spouses:
+            relationships.append(Relationship("marriage", spouses[0].id, spouses[1].id))
+
         for parent in parents:
             for child in children:
-                relationships.append(Relationship(
-                    type="parent-child",
-                    person1=parent.id,
-                    person2=child.id
-                ))
-    
-    def organize_generations(self, individuals: List[Individual], relationships: List[Relationship]):
-        """Organize individuals into proper generations based on relationships"""
-        # Find individuals with parents
-        has_parents = set()
-        for rel in relationships:
-            if rel.type == 'parent-child':
-                has_parents.add(rel.person2)  # person2 is the child
-        
-        # Assign generation 0 to individuals with no parents
-        for individual in individuals:
-            if individual.id not in has_parents:
-                individual.generation = 0
-        
-        # Propagate generations downward
-        max_iterations = 5
-        changed = True
-        
-        while changed and max_iterations > 0:
-            changed = False
-            max_iterations -= 1
-            
-            for rel in relationships:
-                if rel.type == 'parent-child':
-                    parent = next((i for i in individuals if i.id == rel.person1), None)
-                    child = next((i for i in individuals if i.id == rel.person2), None)
-                    
-                    if parent and child:
-                        expected_child_gen = parent.generation + 1
-                        if child.generation != expected_child_gen:
-                            child.generation = expected_child_gen
-                            changed = True
-    
-    def normalize_gender(self, gender: str) -> str:
-        """Normalize gender string to 'male', 'female', or 'unknown'"""
-        g = gender.lower()
-        if g in ['m', 'male']:
-            return 'male'
-        if g in ['f', 'female']:
-            return 'female'
-        return 'unknown'
+                relationships.append(Relationship("parent-child", parent.id, child.id))
+
+    @staticmethod
+    def normalize_gender(gender: Optional[str]) -> str:
+        value = (gender or "").lower()
+        if value in ("m", "male"):
+            return "male"
+        if value in ("f", "female"):
+            return "female"
+        return "unknown"
+
+
+EXTRACTION_PROMPT = """You are a medical genetics expert. Convert the family \
+description below into a strictly valid JSON object describing a pedigree.
+
+Return ONLY raw JSON — no markdown fences, no prose.
+
+{
+  "individuals": [
+    {
+      "id": "lowercase_unique_id",
+      "name": "Display Name",
+      "gender": "male|female|unknown",
+      "age": number or null,
+      "status": "unaffected|affected|carrier|unknown",
+      "conditions": ["condition"],
+      "deceased": true or false
+    }
+  ],
+  "relationships": [
+    { "type": "marriage|parent-child|sibling", "person1": "id", "person2": "id" }
+  ]
+}
+
+Your ONLY job is to capture who exists and how they are related. Do NOT try to \
+position anyone or assign generation numbers — layout is computed separately.
+
+RELATIONSHIP RULES — these matter most:
+1. For "parent-child", person1 is the PARENT and person2 is the CHILD.
+2. Record BOTH parents for every child, as two separate parent-child entries.
+3. EVERY individual must connect to the rest of the family. A relative who is \
+   related only by description is a bug. In particular:
+   - An aunt or uncle who is a BLOOD relative is a child of the corresponding \
+     grandparents — emit parent-child links from both grandparents to them.
+   - An aunt or uncle who married in is NOT a child of the grandparents; link \
+     them by marriage to the blood relative instead.
+   - Cousins are children of an aunt/uncle couple — link them to both.
+   - Nieces and nephews are children of the proband's sibling.
+4. Add a "marriage" entry for every couple, including couples who already share \
+   a child.
+5. Do not invent people who were not described. If a connecting relative is \
+   implied but unnamed (for example the grandparents an uncle descends from), \
+   include them with a descriptive name so the family stays connected.
+
+STATUS RULES:
+- "affected" = has the condition; "carrier" = heterozygous/unaffected carrier;
+  "unaffected" = tested or stated clear; "unknown" = not stated.
+- "deceased" is a separate boolean, never a status value.
+- Mark the person the history centres on with the name "Proband"."""
 
 
 class GeminiPedigreeParser:
-    """AI-enhanced parser using Google Gemini API"""
-    
+    """Extracts a structured family graph from free text using Gemini."""
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.endpoints = [
-            'https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent',
-            'https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent',
-            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+            "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
         ]
-    
-    def query_gemini(self, system_prompt: str, user_content: str) -> str:
-        """Helper to query Gemini using direct REST fallbacks or client SDK"""
-        # Attempt 1: Standard SDK integration
+
+    def query_gemini(self, system_prompt: str, user_content: str,
+                     trace: Optional[PedigreeTrace] = None) -> str:
+        """Try the SDK first, then fall back to the REST endpoints in order."""
+        prompt = f"{system_prompt}\n\nCONTENT:\n{user_content}"
+
         try:
             import google.generativeai as genai
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content(f"{system_prompt}\n\nCONTENT:\n{user_content}")
+            response = model.generate_content(prompt)
+            if trace:
+                trace.event("ai", "Extraction returned via the SDK")
             return response.text
-        except Exception:
-            pass
+        except Exception as exc:                                    # noqa: BLE001
+            if trace:
+                trace.warn("ai", f"SDK call failed, trying REST: {exc}")
 
-        # Attempt 2: REST fallback endpoints
-        body = {
-            "contents": [{
-                "parts": [{"text": f"{system_prompt}\n\nCONTENT:\n{user_content}"}]
-            }]
-        }
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
         for endpoint in self.endpoints:
             try:
-                response = requests.post(
-                    f"{endpoint}?key={self.api_key}",
-                    headers={"Content-Type": "application/json"},
-                    json=body,
-                    timeout=45
-                )
+                response = requests.post(f"{endpoint}?key={self.api_key}",
+                                         headers={"Content-Type": "application/json"},
+                                         json=body, timeout=45)
                 if response.ok:
                     data = response.json()
-                    if "candidates" in data and data["candidates"]:
-                        parts = data["candidates"][0].get("content", {}).get("parts", [])
-                        return "".join([p.get("text", "") for p in parts])
-            except Exception:
-                pass
-        raise RuntimeError("Failed to query Gemini API model on all endpoints")
+                    candidates = data.get("candidates") or []
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if trace:
+                            trace.event("ai", f"Extraction returned via {endpoint}")
+                        return "".join(part.get("text", "") for part in parts)
+                elif trace:
+                    trace.warn("ai", f"{endpoint} returned HTTP {response.status_code}")
+            except Exception as exc:                                # noqa: BLE001
+                if trace:
+                    trace.warn("ai", f"{endpoint} failed: {exc}")
 
-    def parse_to_json(self, prompt: str) -> Dict[str, Any]:
-        """Parse family description using a two-pass Gemini AI pipeline"""
-        log_pedigree_step("PEDIGREE_INPUT", "Processing raw family description input", {"prompt": prompt})
+        raise RuntimeError("Gemini could not be reached on any endpoint")
 
-        # PASS 1: Translate raw description to JSON individuals and relationships
-        pass1_system = """You are a medical genetics expert. Convert the following family description into a strictly valid JSON object for pedigree tree generation.
-REQUIRED JSON STRUCTURE:
-{
-  "individuals": [
-    {
-      "id": "unique_id",
-      "name": "Full Name",
-      "gender": "male|female|unknown",
-      "age": number|null,
-      "status": "unaffected|affected|carrier|deceased|unknown",
-      "conditions": ["condition1", "condition2"],
-      "deceased": boolean,
-      "generation": number
-    }
-  ],
-  "relationships": [
-    {
-      "type": "marriage|parent-child|sibling",
-      "person1": "id1",
-      "person2": "id2"
-    }
-  ]
-}
-RULES:
-1) Output ONLY raw JSON with double quotes; no markdown or prose.
-2) Use lowercase names as ids (e.g., "john").
-3) Create BOTH parent-child links for each parent to each child.
-4) Terminology Correction: A pedigree chart is drawn relative to the patient/proband. Ensure all label names match this perspective:
-   - The children of Aunt or Uncle must be labeled as "Cousin" (or similar), NOT "Niece" or "Nephew" relative to the patient.
-   - Only children of the patient's siblings can be labeled "Niece" or "Nephew".
-5) If the prompt implies a single person (e.g. "mother marries cousin... cousin is father"), merge them into a single person and use the more descriptive term for the name."""
+    def parse_to_json(self, prompt: str,
+                      trace: Optional[PedigreeTrace] = None) -> Dict[str, Any]:
+        """Free text in, ``{individuals, relationships}`` out."""
+        if trace:
+            trace.event("input", "Parsing family description", {"prompt": prompt[:600]})
+            trace.dump_artifact("description.txt", prompt)
 
-        pass1_text = self.query_gemini(pass1_system, prompt)
-        log_pedigree_step("PEDIGREE_PASS1_RESPONSE", "Received raw text from Pass 1", {"text": pass1_text[:200]})
-        
-        json_match = re.search(r'\{[\s\S]*\}', pass1_text)
-        if not json_match:
-            raise ValueError("Pass 1 did not return any JSON object")
-        
-        raw_data = json.loads(json_match.group(0))
+        raw = self.query_gemini(EXTRACTION_PROMPT, prompt, trace)
+        if trace:
+            trace.dump_artifact("model_response.txt", raw)
 
-        # PASS 2: Review and optimize generation indices & sibling order to prevent criss-crossing lines
-        pass2_system = """You are a visual layout engineer for pedigree charts. Your goal is to optimize the generation values and the relative horizontal ordering of individuals inside the 'individuals' list to prevent crossing connection lines when drawing the pedigree.
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            raise ValueError("The model did not return a JSON object")
 
-INPUT JSON:
-{individuals, relationships}
-
-OPTIMIZATION RULES:
-1. GENERATION ALIGNMENT: 
-   - Parents must be on the exact same generation level (e.g., Generation N).
-   - Children of the same parents must be on the exact same generation level (Generation N+1).
-   - Partners of a child (spouses) must also be on the same level (Generation N+1).
-   - Adjust the 'generation' values in the 'individuals' list to be mathematically correct based on parent-child lineages.
-
-2. HORIZONTAL PLACEMENT & ORDER (CRITICAL to prevent line overlaps):
-   - You must reorder the 'individuals' array from left to right.
-   - Spouses/partners (marriage connection) MUST be placed adjacent to each other in the array (e.g. if John marries Jane, they must be next to each other).
-   - The Paternal grandparents should be on the far left, and Maternal grandparents should be on the right.
-   - Consequently, the Father (and his siblings) must be to the left, and the Mother (and her siblings) must be to the right, aligning directly under their parents.
-   - Look at the parent-child lines: if a couple has children, position the couple directly above their children. If the husband's parents are on the left, place the husband on the left of his wife.
-   
-3. OUTPUT:
-   - Output ONLY the optimized JSON structure; no markdown, no comments, no prose."""
-
-        try:
-            pass2_text = self.query_gemini(pass2_system, json.dumps(raw_data, indent=2))
-            log_pedigree_step("PEDIGREE_PASS2_RESPONSE", "Received raw text from Pass 2", {"text": pass2_text[:200]})
-            
-            json_match2 = re.search(r'\{[\s\S]*\}', pass2_text)
-            if json_match2:
-                raw_data = json.loads(json_match2.group(0))
-        except Exception as e:
-            log_pedigree_step("PEDIGREE_PASS2_WARNING", "Pass 2 optimization failed; using Pass 1 output", {"error": str(e)})
-            
-        return self.validate_and_clean_json(raw_data)
-    
-    def validate_and_clean_json(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and clean the JSON structure"""
-        log_pedigree_step("PEDIGREE_VALIDATE_START", "Starting data cleaning and schema validation")
+        data = json.loads(match.group(0))
         if "individuals" not in data or not isinstance(data["individuals"], list):
-            raise ValueError("Invalid JSON: missing individuals array")
-        
-        if "relationships" not in data or not isinstance(data["relationships"], list):
-            data["relationships"] = []
-        
-        # Validate individuals
-        valid_ids = set()
-        for i, person in enumerate(data["individuals"]):
-            person["id"] = person.get("id") or person.get("name", "").lower() or f"person_{i}"
-            person["name"] = person.get("name") or f"Person {i + 1}"
-            # Infer gender from name/id if unknown
-            gender_val = person.get("gender", "unknown").lower()
-            name_lower = (person.get("name") or "").lower()
-            id_lower = (person.get("id") or "").lower()
-            
-            if gender_val == "unknown":
-                male_words = ["father", "dad", "son", "brother", "grandfather", "grandpa", "uncle", "husband", "male", "grandfather"]
-                female_words = ["mother", "mom", "daughter", "sister", "grandmother", "grandma", "aunt", "wife", "female", "grandmother"]
-                
-                if any(w in name_lower or w in id_lower for w in male_words):
-                    gender_val = "male"
-                elif any(w in name_lower or w in id_lower for w in female_words):
-                    gender_val = "female"
-            
-            person["gender"] = gender_val
-            if person["gender"] not in ["male", "female", "unknown"]:
-                person["gender"] = "unknown"
-            person["status"] = person.get("status", "unaffected")
-            if person["status"] not in ["unaffected", "affected", "carrier", "deceased", "unknown"]:
-                person["status"] = "unaffected"
-            person["deceased"] = person.get("deceased", False) or person.get("status") == "deceased"
-            person["conditions"] = person.get("conditions", [])
-            if not isinstance(person["conditions"], list):
-                person["conditions"] = []
-            person["generation"] = person.get("generation", 0)
-            valid_ids.add(person["id"])
-        
-        # Validate relationships
-        data["relationships"] = [
-            rel for rel in data["relationships"]
-            if rel.get("type") in ["marriage", "parent-child", "sibling"]
-            and rel.get("person1") in valid_ids
-            and rel.get("person2") in valid_ids
-        ]
-        
-        log_pedigree_step("PEDIGREE_VALIDATE_COMPLETE", "Schema validation succeeded", {
-            "total_individuals": len(data["individuals"]),
-            "total_relationships": len(data["relationships"])
-        })
+            raise ValueError("Model response is missing an 'individuals' array")
+        data.setdefault("relationships", [])
+
+        if trace:
+            trace.event("input", "Extraction parsed", {
+                "individuals": len(data["individuals"]),
+                "relationships": len(data["relationships"]),
+            })
+            trace.dump_artifact("extracted.json", data)
         return data
 
 
-class PedigreeRenderer:
-    """Renders pedigree trees using PIL/Pillow (Python equivalent of Fabric.js renderer)"""
-    
-    def __init__(self, width: int = 1200, height: int = 800):
-        self.width = width
-        self.height = height
-        self.symbol_size = 36
-        self.generation_spacing = 160
-        self.individual_spacing = 140
-        self.colors = {
-            "male": "#ffffff",
-            "female": "#ffffff",
-            "affected": "#000000",
-            "carrier": "#666666",
-            "deceased": "#ffffff",
-            "border": "#000000",
-            "connection": "#000000",
-            "text": "#333333"
-        }
-        self.positions = {}
-    
-    def render(self, pedigree_data: Dict[str, Any]) -> Image.Image:
-        """Render pedigree data into a PIL Image"""
-        # Create image with white background
-        img = Image.new("RGB", (self.width, self.height), "white")
-        draw = ImageDraw.Draw(img)
-        
-        # Try to load a font, fallback to default if not available
-        try:
-            font_name = ImageFont.truetype("arial.ttf", 12)
-            font_age = ImageFont.truetype("arial.ttf", 10)
-        except:
-            try:
-                font_name = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 12)
-                font_age = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 10)
-            except:
-                font_name = ImageFont.load_default()
-                font_age = ImageFont.load_default()
-        
-        # Calculate positions
-        self.calculate_positions(pedigree_data)
-        
-        # Draw connections first (so they appear behind symbols)
-        self.draw_connections(draw, pedigree_data)
-        
-        # Draw individuals
-        self.draw_individuals(draw, pedigree_data, font_name, font_age)
-        
-        return img
-    
-    def calculate_positions(self, pedigree_data: Dict[str, Any]):
-        """Calculate positions for all individuals"""
-        self.positions = {}
-        
-        generations = pedigree_data.get("generations", [])
-        if not generations:
-            # If no generations, try to organize by generation field
-            individuals = pedigree_data.get("individuals", [])
-            gen_map = {}
-            for ind in individuals:
-                gen = ind.get("generation", 0)
-                if gen not in gen_map:
-                    gen_map[gen] = []
-                gen_map[gen].append(ind)
-            generations = [
-                {"generation": gen, "individuals": indivs}
-                for gen, indivs in sorted(gen_map.items())
-            ]
-        
-        # --- Topological-like sorting to prevent line crossings ---
-        relationships = pedigree_data.get("relationships", [])
-        
-        # Build child-to-parents map
-        child_to_parents = {}
-        for rel in relationships:
-            is_rel_dict = hasattr(rel, "get")
-            if (rel.get("type") if is_rel_dict else getattr(rel, "type", "")) == "parent-child":
-                child = rel.get("person2") if is_rel_dict else getattr(rel, "person2", "")
-                parent = rel.get("person1") if is_rel_dict else getattr(rel, "person1", "")
-                if child not in child_to_parents:
-                    child_to_parents[child] = []
-                child_to_parents[child].append(parent)
-        
-        # Sort each generation's individuals bottom-to-top
-        sorted_gen_indices = sorted([g.get("generation", 0) for g in generations], reverse=True)
-        gen_by_index = {g.get("generation", 0): g for g in generations}
-        
-        if sorted_gen_indices:
-            # Sort bottom generation (keep patient/proband first)
-            bottom_idx = sorted_gen_indices[0]
-            bottom_gen = gen_by_index[bottom_idx]
-            indivs = bottom_gen.get("individuals", [])
-            
-            def bottom_key(ind):
-                name = (ind.get("name") if hasattr(ind, "get") else getattr(ind, "name", "")).lower()
-                ind_id = (ind.get("id") if hasattr(ind, "get") else getattr(ind, "id", "")).lower()
-                if "patient" in name or "proband" in name or "patient" in ind_id or "proband" in ind_id:
-                    return 0
-                return 1
-            bottom_gen["individuals"] = sorted(indivs, key=bottom_key)
-            
-        # Walk up generations and sort parents according to child order
-        for idx in range(len(sorted_gen_indices) - 1):
-            current_gen_idx = sorted_gen_indices[idx]
-            parent_gen_idx = sorted_gen_indices[idx + 1]
-            
-            current_gen = gen_by_index[current_gen_idx]
-            parent_gen = gen_by_index[parent_gen_idx]
-            
-            ordered_children = current_gen.get("individuals", [])
-            parent_individuals = parent_gen.get("individuals", [])
-            
-            new_parent_order = []
-            seen_parents = set()
-            
-            for child in ordered_children:
-                child_id = child.get("id") if hasattr(child, "get") else getattr(child, "id", None)
-                parents_of_child = child_to_parents.get(child_id, [])
-                
-                # Fetch parent objects
-                sorted_parents = []
-                for p_id in parents_of_child:
-                    p_obj = next((p for p in parent_individuals if (p.get("id") if hasattr(p, "get") else getattr(p, "id", None)) == p_id), None)
-                    if p_obj:
-                        sorted_parents.append(p_obj)
-                
-                # Sort parents: male (father) on the left, female (mother) on the right
-                def gender_key(p):
-                    g = (p.get("gender") if hasattr(p, "get") else getattr(p, "gender", "")).lower()
-                    if g == "male":
-                        return 0
-                    if g == "female":
-                        return 1
-                    return 2
-                sorted_parents = sorted(sorted_parents, key=gender_key)
-                
-                for p in sorted_parents:
-                    p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
-                    if p_id not in seen_parents:
-                        new_parent_order.append(p)
-                        seen_parents.add(p_id)
-            
-            # Add any leftover parent individuals (e.g. aunts, uncles with no children in chart)
-            for p in parent_individuals:
-                p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
-                if p_id not in seen_parents:
-                    new_parent_order.append(p)
-                    seen_parents.add(p_id)
-            
-            parent_gen["individuals"] = new_parent_order
-            
-        # Walk down generations (top-to-bottom) and sort children according to their parents' order
-        for idx in range(len(sorted_gen_indices) - 1, 0, -1):
-            parent_gen_idx = sorted_gen_indices[idx]
-            child_gen_idx = sorted_gen_indices[idx - 1]
-            
-            parent_gen = gen_by_index[parent_gen_idx]
-            child_gen = gen_by_index[child_gen_idx]
-            
-            ordered_parents = parent_gen.get("individuals", [])
-            child_individuals = child_gen.get("individuals", [])
-            
-            parent_order_map = {}
-            for p_order, p in enumerate(ordered_parents):
-                p_id = p.get("id") if hasattr(p, "get") else getattr(p, "id", None)
-                parent_order_map[p_id] = p_order
-                
-            def child_sort_key(child):
-                child_id = child.get("id") if hasattr(child, "get") else getattr(child, "id", None)
-                parents_of_child = child_to_parents.get(child_id, [])
-                if not parents_of_child:
-                    return 9999
-                indices = [parent_order_map.get(pid, 9999) for pid in parents_of_child]
-                return min(indices)
-                
-            child_gen["individuals"] = sorted(child_individuals, key=child_sort_key)
-        # Couple-pairing sorter: ensure married partners are kept strictly adjacent,
-        # with spouses positioned on the outer side of the sibling cluster.
-        marriages = [r for r in relationships if r.get("type") == "marriage"]
-        spouse_of = {}
-        for m in marriages:
-            p1 = m.get("person1")
-            p2 = m.get("person2")
-            spouse_of[p1] = p2
-            spouse_of[p2] = p1
-
-        for gen_data in generations:
-            individuals = gen_data.get("individuals", [])
-            if not individuals:
-                continue
-                
-            # Identify which individuals are siblings (have parents in the database)
-            siblings_in_gen = []
-            for ind in individuals:
-                is_dict = hasattr(ind, "get")
-                ind_id = ind.get("id") if is_dict else getattr(ind, "id", None)
-                parents = child_to_parents.get(ind_id, [])
-                if parents:
-                    siblings_in_gen.append(ind_id)
-            
-            # Map each sibling ID to its index in the current sorted sibling list
-            sibling_index_map = {sid: idx for idx, sid in enumerate(siblings_in_gen)}
-            
-            grouped_indivs = []
-            visited = set()
-            
-            for ind in individuals:
-                is_dict = hasattr(ind, "get")
-                ind_id = ind.get("id") if is_dict else getattr(ind, "id", None)
-                if ind_id in visited:
-                    continue
-                    
-                spouse_id = spouse_of.get(ind_id)
-                if spouse_id:
-                    spouse_obj = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == spouse_id), None)
-                    if spouse_obj:
-                        # Determine sibling status
-                        ind_is_sibling = ind_id in sibling_index_map
-                        spouse_is_sibling = spouse_id in sibling_index_map
-                        
-                        if ind_is_sibling and not spouse_is_sibling:
-                            # Sibling is ind, Spouse is in-law
-                            sib_idx = sibling_index_map[ind_id]
-                            # If sibling is on the left half of the sibling group, put spouse on left
-                            if len(siblings_in_gen) > 1 and sib_idx < len(siblings_in_gen) / 2:
-                                grouped_indivs.append((spouse_obj, ind))
-                            else:
-                                grouped_indivs.append((ind, spouse_obj))
-                        elif not ind_is_sibling and spouse_is_sibling:
-                            # Sibling is spouse_obj, Spouse is in-law (ind)
-                            sib_idx = sibling_index_map[spouse_id]
-                            # If sibling is on the left half of the sibling group, put spouse on left
-                            if len(siblings_in_gen) > 1 and sib_idx < len(siblings_in_gen) / 2:
-                                grouped_indivs.append((ind, spouse_obj))
-                            else:
-                                grouped_indivs.append((spouse_obj, ind))
-                        else:
-                            # Both are siblings or both are in-laws, sort by male on left
-                            g1 = (ind.get("gender") if is_dict else getattr(ind, "gender", "")).lower()
-                            if g1 == "male":
-                                grouped_indivs.append((ind, spouse_obj))
-                            else:
-                                grouped_indivs.append((spouse_obj, ind))
-                                
-                        visited.add(ind_id)
-                        visited.add(spouse_id)
-                        continue
-                
-                grouped_indivs.append((ind,))
-                visited.add(ind_id)
-                
-            flat_individuals = []
-            for group in grouped_indivs:
-                flat_individuals.extend(group)
-            gen_data["individuals"] = flat_individuals
-
-        # Assign calculated coordinates
-        for gen_data in generations:
-            gen_index = gen_data.get("generation", 0)
-            individuals = gen_data.get("individuals", [])
-            y = 50 + (gen_index * self.generation_spacing)
-            
-            total_width = (len(individuals) - 1) * self.individual_spacing if len(individuals) > 1 else 0
-            start_x = (self.width - total_width) / 2
-            
-            for idx, individual in enumerate(individuals):
-                x = start_x + (idx * self.individual_spacing) if len(individuals) > 1 else self.width / 2
-                is_dict_like = hasattr(individual, "get")
-                ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
-                self.positions[ind_id] = (x, y)
-    
-    def draw_connections(self, draw: ImageDraw.Draw, pedigree_data: Dict[str, Any]):
-        """Draw relationship connections"""
-        relationships = pedigree_data.get("relationships", [])
-        
-        # Draw marriage connections
-        marriages = [r for r in relationships if r["type"] == "marriage"]
-        for marriage in marriages:
-            pos1 = self.positions.get(marriage["person1"])
-            pos2 = self.positions.get(marriage["person2"])
-            if pos1 and pos2:
-                draw.line([pos1[0], pos1[1], pos2[0], pos2[1]], 
-                         fill=self.colors["connection"], width=2)
-                # Marriage symbol (small square in middle)
-                mid_x = (pos1[0] + pos2[0]) / 2
-                mid_y = (pos1[1] + pos2[1]) / 2
-                draw.rectangle([mid_x - 3, mid_y - 3, mid_x + 3, mid_y + 3],
-                              fill=self.colors["border"], outline=None)
-        
-        # Draw parent-child connections
-        parent_child_rels = [r for r in relationships if r["type"] == "parent-child"]
-        
-        # Group by child
-        child_to_parents = {}
-        for rel in parent_child_rels:
-            child_id = rel["person2"]
-            parent_id = rel["person1"]
-            if child_id not in child_to_parents:
-                child_to_parents[child_id] = []
-            child_to_parents[child_id].append(parent_id)
-        
-        for child_id, parent_ids in child_to_parents.items():
-            child_pos = self.positions.get(child_id)
-            if not child_pos:
-                continue
-            
-            # Use exact midpoint between generations for horizontal connector lines
-            mid_generation_y = child_pos[1] - self.generation_spacing / 2
-            
-            if len(parent_ids) == 1:
-                # Single parent
-                parent_pos = self.positions.get(parent_ids[0])
-                if parent_pos:
-                    mid_y = parent_pos[1] + self.symbol_size/2
-                    # Orthogonal routing: down, sideways, down to child
-                    draw.line([parent_pos[0], mid_y, parent_pos[0], mid_generation_y],
-                             fill=self.colors["connection"], width=2)
-                    draw.line([parent_pos[0], mid_generation_y, child_pos[0], mid_generation_y],
-                             fill=self.colors["connection"], width=2)
-                    draw.line([child_pos[0], mid_generation_y, child_pos[0], child_pos[1] - self.symbol_size/2],
-                             fill=self.colors["connection"], width=2)
-            elif len(parent_ids) == 2:
-                # Both parents
-                parent1_pos = self.positions.get(parent_ids[0])
-                parent2_pos = self.positions.get(parent_ids[1])
-                
-                if parent1_pos and parent2_pos:
-                    mid_x = (parent1_pos[0] + parent2_pos[0]) / 2
-                    mid_y = (parent1_pos[1] + parent2_pos[1]) / 2
-                    
-                    # Vertical line from parents' midpoint down
-                    draw.line([mid_x, mid_y + 15, mid_x, mid_generation_y],
-                             fill=self.colors["connection"], width=2)
-                    # Horizontal line to child
-                    draw.line([mid_x, mid_generation_y, child_pos[0], mid_generation_y],
-                             fill=self.colors["connection"], width=2)
-                    # Final vertical line to child
-                    draw.line([child_pos[0], mid_generation_y,
-                              child_pos[0], child_pos[1] - self.symbol_size/2],
-                             fill=self.colors["connection"], width=2)
-    
-    def draw_individuals(self, draw: ImageDraw.Draw, pedigree_data: Dict[str, Any],
-                        font_name, font_age):
-        """Draw all individual symbols"""
-        for individual in pedigree_data.get("individuals", []):
-            is_dict_like = hasattr(individual, "get")
-            ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
-            pos = self.positions.get(ind_id)
-            if not pos:
-                continue
-            
-            x, y = pos
-            # Convert to dictionary safely
-            ind_dict = {}
-            if is_dict_like:
-                try:
-                    ind_dict = dict(individual.items())
-                except Exception:
-                    ind_dict = individual
-            else:
-                try:
-                    ind_dict = asdict(individual)
-                except Exception:
-                    ind_dict = individual
-            
-            self.draw_symbol(draw, ind_dict, x, y, font_name, font_age)
-    
-    def draw_symbol(self, draw: ImageDraw.Draw, individual: Dict[str, Any],
-                   x: float, y: float, font_name, font_age):
-        """Draw a single individual symbol"""
-        size = self.symbol_size
-        half_size = size / 2
-        
-        # Determine fill color
-        if individual["status"] == "affected":
-            fill = self.colors["affected"]
-        elif individual["status"] == "carrier":
-            fill = self.colors["male"]  # Will add dot overlay
-        else:
-            fill = self.colors["male"] if individual["gender"] == "male" else self.colors["female"]
-        
-        # Draw base shape
-        if individual["gender"] == "male":
-            # Square
-            draw.rectangle([x - half_size, y - half_size, x + half_size, y + half_size],
-                          fill=fill, outline=self.colors["border"], width=2)
-        elif individual["gender"] == "female":
-            # Circle
-            draw.ellipse([x - half_size, y - half_size, x + half_size, y + half_size],
-                        fill=fill, outline=self.colors["border"], width=2)
-        else:
-            # Diamond for unknown gender
-            points = [
-                (x, y - half_size),
-                (x + half_size, y),
-                (x, y + half_size),
-                (x - half_size, y)
-            ]
-            draw.polygon(points, fill=fill, outline=self.colors["border"], width=2)
-        
-        # Add special markings
-        if individual["status"] == "carrier":
-            # Carrier dot in center
-            draw.ellipse([x - 4, y - 4, x + 4, y + 4],
-                        fill=self.colors["carrier"], outline=None)
-        
-        if individual["status"] == "unknown":
-            # Draw "?" inside symbol to indicate unknown disease status
-            bbox = draw.textbbox((0, 0), "?", font=font_name)
-            t_w = bbox[2] - bbox[0]
-            t_h = bbox[3] - bbox[1]
-            draw.text((x - t_w/2, y - t_h/2 - 2), "?", fill=self.colors["text"], font=font_name)
-
-        if individual.get("deceased") or individual["status"] == "deceased":
-            # Deceased diagonal line (draw in white if symbol is black/affected)
-            diagonal_color = "#ffffff" if individual["status"] == "affected" else self.colors["border"]
-            draw.line([x - half_size, y - half_size, x + half_size, y + half_size],
-                     fill=diagonal_color, width=2)
-        
-        # Add labels with word-wrapping
-        name = individual["name"]
-        words = name.split()
-        lines = []
-        current_line = []
-        for word in words:
-            if len(" ".join(current_line + [word])) > 12:
-                if current_line:
-                    lines.append(" ".join(current_line))
-                    current_line = [word]
-                else:
-                    lines.append(word)
-            else:
-                current_line.append(word)
-        if current_line:
-            lines.append(" ".join(current_line))
-            
-        y_offset = y + half_size + 5
-        for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font_name)
-            t_w = bbox[2] - bbox[0]
-            t_h = bbox[3] - bbox[1]
-            draw.text((x - t_w/2, y_offset), line, fill=self.colors["text"], font=font_name)
-            y_offset += t_h + 2
-        
-        # Age
-        if individual.get("age"):
-            age_text = f"{individual['age']}y"
-            bbox = draw.textbbox((0, 0), age_text, font=font_age)
-            text_width = bbox[2] - bbox[0]
-            draw.text((x - text_width/2, y_offset),
-                     age_text, fill="#666666", font=font_age)
-    
-    def export_as_png(self, pedigree_data: Dict[str, Any]) -> bytes:
-        """Export pedigree as PNG bytes"""
-        img = self.render(pedigree_data)
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        return buffer.getvalue()
-
-
 class PedigreeGenerator:
-    """Main pedigree generator class that orchestrates parsing and rendering"""
-    
+    """Orchestrates extraction, layout, validation and SVG rendering."""
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
         self.simple_parser = SimplePedigreeParser()
         self.gemini_parser = GeminiPedigreeParser(api_key) if api_key else None
-        self.renderer = PedigreeRenderer()
-    
-    def parse_family_description(self, description: str, use_ai: bool = True) -> Dict[str, Any]:
-        """
-        Parse natural language family description into structured pedigree data
-        
-        Args:
-            description: Natural language description of family tree
-            use_ai: Whether to use Gemini AI (if available) or fallback to simple parser
-            
-        Returns:
-            Dictionary with 'individuals', 'relationships', and 'generations'
-        """
+
+    # -- extraction --
+
+    def parse_family_description(self, description: str, use_ai: bool = True,
+                                 trace: Optional[PedigreeTrace] = None) -> Dict[str, Any]:
+        """Structured family graph from a natural-language description."""
         if use_ai and self.gemini_parser:
             try:
-                json_data = self.gemini_parser.parse_to_json(description)
-                # Organize generations
-                return self._organize_generations(json_data)
-            except Exception as e:
-                log_pedigree_step("PEDIGREE_PARSE_WARNING", "AI parsing failed; falling back to simple regex parser", {"error": str(e)})
-        
-        # Fallback to simple parser
-        log_pedigree_step("PEDIGREE_FALLBACK", "Using regex simple parser fallback")
+                return self.gemini_parser.parse_to_json(description, trace)
+            except Exception as exc:                                # noqa: BLE001
+                if trace:
+                    trace.warn("input", f"AI extraction failed, using regex fallback: {exc}")
+
+        if trace:
+            trace.event("input", "Using the regex fallback parser")
         return self.simple_parser.parse(description)
-    
-    def _organize_generations(self, pedigree_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Organize individuals into proper generations using spouse and parent-child constraint solver"""
-        log_pedigree_step("PEDIGREE_ORGANIZE_START", "Organizing pedigree individuals into generations")
-        individuals = pedigree_data["individuals"]
-        relationships = pedigree_data.get("relationships", [])
-        
-        # Find individuals with no parents (generation 0)
-        has_parents = set()
-        for rel in relationships:
-            if rel.get("type") == "parent-child":
-                has_parents.add(rel.get("person2"))
-        
-        # Assign initial generation levels: roots get 0, others get -1
-        for individual in individuals:
-            is_dict_like = hasattr(individual, "get")
-            ind_id = individual.get("id") if is_dict_like else getattr(individual, "id", None)
-            
-            # Check if this individual has explicit generation from the visual pass
-            explicit_gen = individual.get("generation") if is_dict_like else getattr(individual, "generation", -1)
-            
-            # If not explicitly assigned a valid level >= 0, initialize
-            if explicit_gen is None or explicit_gen < 0:
-                init_val = 0 if ind_id not in has_parents else -1
-                if is_dict_like:
-                    individual["generation"] = init_val
-                else:
-                    try:
-                        individual.generation = init_val
-                    except Exception:
-                        pass
-        
-        # Iteratively solve constraints: 
-        # 1. child.generation = parent.generation + 1
-        # 2. spouse1.generation == spouse2.generation
-        max_iterations = 20
-        changed = True
-        
-        while changed and max_iterations > 0:
-            changed = False
-            max_iterations -= 1
-            
-            # Constraint 1: Parent-Child propagation
-            for rel in relationships:
-                is_rel_dict = hasattr(rel, "get")
-                rel_type = rel.get("type") if is_rel_dict else getattr(rel, "type", "")
-                if rel_type == "parent-child":
-                    parent_id = rel.get("person1") if is_rel_dict else getattr(rel, "person1", None)
-                    child_id = rel.get("person2") if is_rel_dict else getattr(rel, "person2", None)
-                    
-                    parent = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == parent_id), None)
-                    child = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == child_id), None)
-                    
-                    if parent and child:
-                        parent_is_dict = hasattr(parent, "get")
-                        child_is_dict = hasattr(child, "get")
-                        parent_gen = parent.get("generation") if parent_is_dict else getattr(parent, "generation", -1)
-                        child_gen = child.get("generation") if child_is_dict else getattr(child, "generation", -1)
-                        
-                        if parent_gen >= 0 and child_gen != parent_gen + 1:
-                            expected_gen = parent_gen + 1
-                            if child_is_dict:
-                                child["generation"] = expected_gen
-                            else:
-                                try:
-                                    child.generation = expected_gen
-                                except Exception:
-                                    pass
-                            changed = True
-            
-            # Constraint 2: Spouse generation equivalence
-            for rel in relationships:
-                is_rel_dict = hasattr(rel, "get")
-                rel_type = rel.get("type") if is_rel_dict else getattr(rel, "type", "")
-                if rel_type == "marriage":
-                    p1_id = rel.get("person1") if is_rel_dict else getattr(rel, "person1", None)
-                    p2_id = rel.get("person2") if is_rel_dict else getattr(rel, "person2", None)
-                    
-                    p1 = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == p1_id), None)
-                    p2 = next((i for i in individuals if (i.get("id") if hasattr(i, "get") else getattr(i, "id", None)) == p2_id), None)
-                    
-                    if p1 and p2:
-                        p1_is_dict = hasattr(p1, "get")
-                        p2_is_dict = hasattr(p2, "get")
-                        p1_gen = p1.get("generation") if p1_is_dict else getattr(p1, "generation", -1)
-                        p2_gen = p2.get("generation") if p2_is_dict else getattr(p2, "generation", -1)
-                        
-                        if p1_gen >= 0 or p2_gen >= 0:
-                            target_gen = max(p1_gen, p2_gen)
-                            if p1_gen != target_gen:
-                                if p1_is_dict:
-                                    p1["generation"] = target_gen
-                                else:
-                                    try:
-                                        p1.generation = target_gen
-                                    except Exception:
-                                        pass
-                                changed = True
-                            if p2_gen != target_gen:
-                                if p2_is_dict:
-                                    p2["generation"] = target_gen
-                                else:
-                                    try:
-                                        p2.generation = target_gen
-                                    except Exception:
-                                        pass
-                                changed = True
-        
-        # Group by generation
-        generations = {}
-        for individual in individuals:
-            is_ind_dict = hasattr(individual, "get")
-            gen = max(0, individual.get("generation") if is_ind_dict else getattr(individual, "generation", 0))
-            if gen not in generations:
-                generations[gen] = []
-            generations[gen].append(individual)
-        
-        pedigree_data["generations"] = [
-            {"generation": gen, "individuals": indivs}
-            for gen, indivs in sorted(generations.items())
-        ]
-        
-        log_pedigree_step("PEDIGREE_ORGANIZE_COMPLETE", "Successfully sorted individuals into generations", {
-            "generations_count": len(pedigree_data["generations"])
-        })
-        return pedigree_data
-    
-    def generate_image(self, pedigree_data: Dict[str, Any]) -> Image.Image:
-        """Generate PIL Image from pedigree data"""
-        return self.renderer.render(pedigree_data)
-    
-    def generate_png_bytes(self, pedigree_data: Dict[str, Any]) -> bytes:
-        """Generate PNG bytes from pedigree data"""
-        return self.renderer.export_as_png(pedigree_data)
+
+    # -- layout + render --
+
+    def build_layout(self, pedigree_data: Dict[str, Any],
+                     trace: Optional[PedigreeTrace] = None) -> PedigreeLayout:
+        return compute_layout(pedigree_data.get("individuals", []),
+                              pedigree_data.get("relationships", []),
+                              trace=trace)
+
+    def generate_svg(self, pedigree_data: Dict[str, Any],
+                     title: str = "Pedigree chart",
+                     trace: Optional[PedigreeTrace] = None,
+                     validate: bool = True) -> str:
+        """Render a structured family graph to an SVG document."""
+        layout = self.build_layout(pedigree_data, trace)
+
+        if validate:
+            report = validate_layout(layout, pedigree_data.get("individuals", []),
+                                     pedigree_data.get("relationships", []))
+            if trace:
+                trace.event("validate", f"Geometry check: {report.summary()}",
+                            {"stats": report.stats,
+                             "errors": [str(i) for i in report.errors],
+                             "warnings": [str(i) for i in report.warnings]})
+            # Errors are reported, not raised: a slightly imperfect chart is far
+            # more useful to a counselor than no chart at all.
+            if report.errors:
+                log_pedigree_step("PEDIGREE_GEOMETRY",
+                                  f"Rendered with {len(report.errors)} geometry issue(s)",
+                                  [str(i) for i in report.errors[:5]])
+
+        return render_svg(layout, title=title)
+
+    def render_from_description(self, description: str, use_ai: bool = True,
+                                title: str = "Pedigree chart") -> Dict[str, Any]:
+        """One-shot: description in, SVG plus the structured data out."""
+        trace = PedigreeTrace("pedigree")
+        try:
+            data = self.parse_family_description(description, use_ai=use_ai, trace=trace)
+            svg = self.generate_svg(data, title=title, trace=trace)
+            return {"svg": svg, "pedigree_data": data, "trace": trace.finish()}
+        finally:
+            trace.finish()

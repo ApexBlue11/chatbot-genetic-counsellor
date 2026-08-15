@@ -1,39 +1,62 @@
 const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '') + '/api';
 
+/**
+ * Every response was previously passed straight to res.json() without checking
+ * res.ok, so a 500 resolved to an error body that callers treated as a real
+ * record (a conversation with id: undefined), and a dead backend surfaced only
+ * as a console message. Failures now throw with something worth showing.
+ */
+async function request(path, options = {}) {
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, options);
+  } catch {
+    throw new Error("Can't reach the VariantMind backend. Is it running on port 8000?");
+  }
+
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body.detail || body.message || '';
+    } catch {
+      detail = await res.text().catch(() => '');
+    }
+    throw new Error(detail || `Request failed (HTTP ${res.status})`);
+  }
+
+  if (res.status === 204) return null;
+  return res.json().catch(() => null);
+}
+
 const api = {
-  getConversations: async () => {
-    const res = await fetch(`${API_BASE}/conversations`);
-    return res.json();
-  },
-  
+  getConversations: () => request('/conversations/'),
+
   createConversation: async (title) => {
-    const res = await fetch(`${API_BASE}/conversations/`, {
+    const conv = await request('/conversations/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title })
+      body: JSON.stringify({ title }),
     });
-    return res.json();
+    if (!conv || !conv.id) {
+      throw new Error('The backend did not return a conversation id.');
+    }
+    return conv;
   },
-  
-  deleteConversation: async (id) => {
-    await fetch(`${API_BASE}/conversations/${id}`, { method: 'DELETE' });
-  },
-  
-  renameConversation: async (id, title) => {
-    await fetch(`${API_BASE}/conversations/${id}`, {
+
+  deleteConversation: (id) => request(`/conversations/${id}`, { method: 'DELETE' }),
+
+  renameConversation: (id, title) =>
+    request(`/conversations/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title })
-    });
-  },
-  
-  getMessages: async (id) => {
-    const res = await fetch(`${API_BASE}/conversations/${id}/messages`);
-    return res.json();
-  },
-  
-  sendMessage: async (conversationId, userInput, aiEnabled, svEnabled, pedEnabled = false, systemContext = null) => {
-    const res = await fetch(`${API_BASE}/chat/`, {
+      body: JSON.stringify({ title }),
+    }),
+
+  getMessages: (id) => request(`/conversations/${id}/messages`),
+
+  sendMessage: (conversationId, userInput, aiEnabled, svEnabled, pedEnabled = false, systemContext = null) =>
+    request('/chat/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -42,36 +65,19 @@ const api = {
         ai_enabled: aiEnabled,
         sv_enabled: svEnabled,
         ped_enabled: pedEnabled,
-        system_context: systemContext
-      })
-    });
-    if (!res.ok) throw new Error("Failed to send message");
-    return res.json();
-  },
-  
-  uploadVcf: async (conversationId, file, patientLabel = '') => {
+        system_context: systemContext,
+      }),
+    }),
+
+  uploadVcf: (conversationId, file, patientLabel = '') => {
     const formData = new FormData();
     formData.append('conversation_id', conversationId);
     formData.append('patient_label', patientLabel);
     formData.append('file', file);
-    
-    const res = await fetch(`${API_BASE}/upload/`, {
-      method: 'POST',
-      body: formData
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
-      throw new Error(err.detail || 'Failed to upload VCF');
-    }
-    return res.json();
+    return request('/upload/', { method: 'POST', body: formData });
   },
 
-  
-  getVariantDetails: async (variantId) => {
-    const res = await fetch(`${API_BASE}/chat/variant/${variantId}`);
-    if (!res.ok) throw new Error("Failed to fetch variant details");
-    return res.json();
-  }
+  getVariantDetails: (variantId) => request(`/chat/variant/${variantId}`),
 };
 
 export default api;

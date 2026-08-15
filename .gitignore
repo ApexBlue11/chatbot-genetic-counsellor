@@ -63,6 +63,11 @@ dist/
 api_key/
 scratch/
 tests/logs/
+
+# Generated at runtime / by the test suites
+logs/
+tests/pedigree_out/
+test_outputs/
 *.json
 !package.json
 !package-lock.json

@@ -60,15 +60,28 @@ function MessageBubble({ message }) {
     }
 
     if (metadata.type === 'pedigree_chart') {
+      // Charts are vector SVG. Rendering through a data: URI in an <img> keeps
+      // the model-supplied names inert while staying sharp at any zoom.
+      // image_base64 is the legacy PNG field, still present on older messages.
+      const chartSrc = metadata.svg
+        ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(metadata.svg)}`
+        : metadata.image_base64
+          ? `data:image/png;base64,${metadata.image_base64}`
+          : null;
+
       return (
         <div className="message-metadata" style={{ textAlign: 'center' }}>
           <div style={{ marginBottom: '1rem', fontWeight: 600 }}>🧬 Generated Pedigree Chart</div>
           <div style={{ padding: '1rem', backgroundColor: '#F1F5F9', borderRadius: '8px' }}>
-            {metadata.image_base64 ? (
-              <img src={`data:image/png;base64,${metadata.image_base64}`} alt="Pedigree Chart" style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', border: '1px solid #E2E8F0' }} />
+            {chartSrc ? (
+              <img
+                src={chartSrc}
+                alt="Pedigree chart"
+                style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px', border: '1px solid #E2E8F0', background: '#fff' }}
+              />
             ) : (
               <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                Image generation failed. Backend returned structural data only.
+                Chart generation failed. Backend returned structural data only.
               </span>
             )}
             <details style={{ textAlign: 'left', marginTop: '1rem' }}>
