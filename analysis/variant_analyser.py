@@ -145,12 +145,84 @@ class VariantAnalyzer:
         # Find literature references
         literature_references = self._find_literature_references(myvariant_data, clinvar_data)
         
+        population_frequency = self._extract_population_frequency(myvariant_data, vep_data)
+
         return {
             "pathogenicity_prediction": pathogenicity,
             "functional_impact": functional_impact,
             "clinical_relevance": clinical_relevance,
+            "population_frequency": population_frequency,
             "literature_references": literature_references
         }
+
+    # gnomAD ancestry group codes, in the order a counselor usually wants them.
+    _POP_LABELS = [
+        ("af", "global"),
+        ("af_nfe", "European (non-Finnish)"),
+        ("af_fin", "European (Finnish)"),
+        ("af_afr", "African/African-American"),
+        ("af_amr", "Admixed American"),
+        ("af_eas", "East Asian"),
+        ("af_sas", "South Asian"),
+        ("af_asj", "Ashkenazi Jewish"),
+        ("af_oth", "Other"),
+    ]
+    # VEP spells the same groups differently.
+    _VEP_LABELS = [
+        ("gnomade", "global"),
+        ("gnomade_nfe", "European (non-Finnish)"),
+        ("gnomade_fin", "European (Finnish)"),
+        ("gnomade_afr", "African/African-American"),
+        ("gnomade_amr", "Admixed American"),
+        ("gnomade_eas", "East Asian"),
+        ("gnomade_sas", "South Asian"),
+        ("gnomade_asj", "Ashkenazi Jewish"),
+    ]
+
+    def _extract_population_frequency(self, myvariant_data: Dict[str, Any],
+                                      vep_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Pull gnomAD allele frequencies out of the raw API payloads.
+
+        These were never being read. MyVariant returns them under
+        gnomad_exome.af.* and VEP under colocated_variants[].frequencies.<alt>.*,
+        but nothing extracted either, so the tool reported no frequency data for
+        variants where both APIs had it — and the model filled the gap from its
+        own knowledge instead.
+        """
+        out: Dict[str, Any] = {}
+
+        def add(label: str, value: Any, source: str):
+            if label in out or not isinstance(value, (int, float)):
+                return
+            out[label] = {"allele_frequency": round(float(value), 8),
+                          "percent": round(float(value) * 100, 4),
+                          "source": source}
+
+        for block, source in (("gnomad_exome", "gnomAD exomes"),
+                              ("gnomad_genome", "gnomAD genomes")):
+            af = (myvariant_data or {}).get(block, {})
+            if isinstance(af, dict):
+                af = af.get("af", af)
+            if isinstance(af, dict):
+                for key, label in self._POP_LABELS:
+                    add(label, af.get(key), source)
+            elif isinstance(af, (int, float)):
+                add("global", af, source)
+
+        # VEP is the fallback when MyVariant has no record for this identifier.
+        try:
+            for entry in (vep_data or [])[:1]:
+                for co in (entry.get("colocated_variants") or []):
+                    for _alt, freqs in (co.get("frequencies") or {}).items():
+                        if not isinstance(freqs, dict):
+                            continue
+                        for key, label in self._VEP_LABELS:
+                            add(label, freqs.get(key), "gnomAD via Ensembl VEP")
+                        add("global", freqs.get("af"), "1000 Genomes via Ensembl VEP")
+        except (AttributeError, TypeError):
+            pass
+
+        return out
     
     def _predict_pathogenicity(self, myvariant_data: Dict[str, Any], vep_data: List[Dict[str, Any]], 
                               clinvar_data: Dict[str, Any]) -> Dict[str, Any]:

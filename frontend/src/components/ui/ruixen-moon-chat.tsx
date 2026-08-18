@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { Bot, Loader2, Dna, GitBranch, Activity, Upload } from "lucide-react";
 import api from "../../services/api";
 import MessageBubble from "../MessageBubble";
+import ThinkingIndicator from "../ThinkingIndicator";
 import { SmartPasteInput, type PasteAttachment, derivePasteTitle } from "./smart-paste-input";
 
 interface RuixenMoonChatProps {
@@ -286,10 +287,7 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
                 <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/20 text-emerald-400">
                   <Bot size={18} />
                 </div>
-                <div className="flex items-center gap-2 text-sm font-medium text-slate-300">
-                  <Loader2 size={16} className="animate-spin text-emerald-400" />
-                  Analysing genomic databases…
-                </div>
+                <ThinkingIndicator />
               </div>
             )}
             <div ref={endOfMessagesRef} />

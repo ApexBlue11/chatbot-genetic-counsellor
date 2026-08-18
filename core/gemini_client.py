@@ -106,11 +106,16 @@ def _model_rank(name: str) -> tuple:
     """
     n = name.lower()
 
+    # Flash outranks pro deliberately. Pro is slower and, on a free-tier key,
+    # its daily quota is exhausted almost immediately — every pro model returned
+    # 429 while flash answered — so ranking pro first just bought a round trip
+    # of 429s before reaching a model that works. Lite stays last: it is the one
+    # that skipped its tools and answered from memory.
     if 'lite' in n:
         tier = 1
-    elif 'pro' in n:
-        tier = 3
     elif 'flash' in n:
+        tier = 3
+    elif 'pro' in n:
         tier = 2
     else:
         tier = 0
@@ -125,6 +130,43 @@ def _model_rank(name: str) -> tuple:
     return (tier, stable, version)
 
 
+# Newer Gemini models do extended internal reasoning before answering, and those
+# thinking tokens count toward the output budget. Uncapped, "Say ok" took 28s on
+# gemini-flash-latest; with a cap it took 1.7s — the same model, the same prompt.
+# This deprecated SDK has no thinking_config field, so bounding max_output_tokens
+# is the only lever available. The default leaves ample room for a full clinical
+# answer (measured responses run ~1,500-2,000 tokens) while stopping the model
+# reasoning indefinitely.
+MAX_OUTPUT_TOKENS = int(os.getenv("VARIANTMIND_MAX_OUTPUT_TOKENS", "6144"))
+
+
+def _generation_config() -> Dict[str, Any]:
+    return {"max_output_tokens": MAX_OUTPUT_TOKENS}
+
+
+# Models that returned 429 recently, so a request does not keep paying a round
+# trip to rediscover the same exhausted quota.
+_QUOTA_BLOCKED: Dict[str, float] = {}
+_QUOTA_COOLDOWN = 600.0
+
+
+def _is_blocked(name: str) -> bool:
+    import time
+    until = _QUOTA_BLOCKED.get(name)
+    if until is None:
+        return False
+    if time.time() > until:
+        _QUOTA_BLOCKED.pop(name, None)
+        return False
+    return True
+
+
+def _note_failure(name: str, error: str) -> None:
+    import time
+    if "429" in error or "quota" in error.lower():
+        _QUOTA_BLOCKED[name] = time.time() + _QUOTA_COOLDOWN
+
+
 def _fallback_models() -> List[str]:
     return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
 
@@ -133,14 +175,19 @@ def generate_with_fallback(genai, prompt: str, on_status=None) -> Tuple[str, str
     models = discover_text_models(genai)
     last_error = None
     for model_name in models:
+        if _is_blocked(model_name):
+            continue
         try:
             if on_status:
                 on_status(f"Querying `{model_name}`...")
-            model = genai.GenerativeModel(model_name)
+            model = genai.GenerativeModel(
+                model_name, generation_config=_generation_config()
+            )
             response = model.generate_content(prompt)
             return response.text, model_name
         except Exception as e:
             last_error = str(e)
+            _note_failure(model_name, last_error)
             if on_status:
                 if "429" in last_error or "quota" in last_error.lower():
                     on_status(f"⚠️ `{model_name}` rate-limited. Trying next model...")
@@ -187,9 +234,19 @@ def search_pubmed(query_term: str) -> str:
                 f"{i}. Title: {p['title']}\n"
                 f"   Journal: {p['journal']} ({p['pubdate']})\n"
                 f"   Authors: {p['authors']}\n"
+                f"   PMID: {p['pmid']}\n"
                 f"   Link: {p['link']}"
             )
-        return "\n\n".join(res)
+        # Without the PMID stated as its own required field, the model cited
+        # these papers by author and year alone, leaving the reader no way to
+        # check them — the opposite of the point of retrieving them.
+        return (
+            "\n\n".join(res)
+            + "\n\nCITATION REQUIREMENT: when referring to any of these papers you MUST "
+              "include its PMID as a markdown link, e.g. "
+              "([PMID: 12345678](https://pubmed.ncbi.nlm.nih.gov/12345678/)). "
+              "Never cite a paper that is not in this list, and never cite one without its PMID."
+        )
     except Exception as e:
         return f"Error searching PubMed: {str(e)}"
 
@@ -520,7 +577,10 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
             if on_status:
                 on_status(f"Running agent on `{model_name}`...")
 
-            model = genai.GenerativeModel(model_name=model_name, tools=tools)
+            model = genai.GenerativeModel(
+                model_name=model_name, tools=tools,
+                generation_config=_generation_config(),
+            )
             chat = model.start_chat(enable_automatic_function_calling=True)
             response = chat.send_message(prompt)
 

@@ -764,3 +764,93 @@ input, textarea {
 }
 
 .conn-status--pill .conn-label { color: #cbd5e1; }
+
+/* ── Thinking indicator ────────────────────────────────────────────────────
+   Replies can take a minute or more, so this has to convey "working" rather
+   than just "not finished". */
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.thinking-orb {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.thinking-orb-core {
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #60a5fa, #6366f1);
+  box-shadow: 0 0 10px rgba(96, 165, 250, 0.75);
+  animation: thinking-breathe 1.6s ease-in-out infinite;
+}
+
+.thinking-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(96, 165, 250, 0.45);
+  border-top-color: rgba(147, 197, 253, 0.95);
+  animation: spin 1.5s linear infinite;
+}
+
+@keyframes thinking-breathe {
+  0%, 100% { transform: scale(1);    opacity: 1; }
+  50%      { transform: scale(0.72); opacity: 0.65; }
+}
+
+.thinking-label {
+  font-weight: 500;
+  color: #cbd5e1;
+  /* Stages swap in place; a fade stops the text snapping between lengths. */
+  animation: thinking-fade 0.4s ease;
+}
+
+@keyframes thinking-fade {
+  from { opacity: 0.35; }
+  to   { opacity: 1; }
+}
+
+.thinking-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.thinking-dots i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #93c5fd;
+  animation: thinking-bounce 1.3s ease-in-out infinite;
+}
+
+.thinking-dots i:nth-child(2) { animation-delay: 0.18s; }
+.thinking-dots i:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes thinking-bounce {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30%           { opacity: 1;    transform: translateY(-3px); }
+}
+
+.thinking-elapsed {
+  margin-left: 0.15rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-sidebar-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-orb-core,
+  .thinking-orb-ring,
+  .thinking-dots i { animation: none; }
+}

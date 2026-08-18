@@ -289,6 +289,17 @@ def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_contex
         )
 
     system_parts.append(
+        "CITATIONS: every reference to published literature must carry the PMID "
+        "returned by search_pubmed, written as a markdown link "
+        "([PMID: 12345678](https://pubmed.ncbi.nlm.nih.gov/12345678/)). Cite only "
+        "papers that tool actually returned; if you did not call it, say so rather "
+        "than citing from memory.\n"
+        "RETRIEVED VS RECALLED: name the database each fact came from. If a tool "
+        "lists a field under data_not_retrieved, do not supply that number from "
+        "prior knowledge without labelling it as general knowledge rather than a lookup."
+    )
+
+    system_parts.append(
         "CRITICAL RESPONSE RULES:\n"
         "1. ALWAYS wrap your step-by-step clinical reasoning in:\n"
         "   <details><summary>Clinical Thinking Process</summary>\n"
