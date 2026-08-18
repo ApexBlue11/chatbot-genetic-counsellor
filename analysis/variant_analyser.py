@@ -233,42 +233,66 @@ class VariantAnalyzer:
         evidence = []
         score = 0.5
         
-        # Check ClinVar from MyVariant first (highest specificity to variant)
+        # ClinVar's own aggregate classification comes first. It is the reviewed
+        # consensus across submitters and it carries a review status, which the
+        # per-submission RCV records do not.
+        #
+        # Scanning the RCVs first, as this used to, was wrong twice over: any
+        # single submission containing the substring "pathogenic" won outright,
+        # and "pathogenic" is a substring of "pathogenicity". So the very common
+        # ClinVar value "Conflicting interpretations of pathogenicity" was read
+        # as Pathogenic. For rs1801133 (MTHFR c.677C>T) that turned 9 submissions
+        # — none of them pathogenic, and ClinVar's own aggregate of "Benign,
+        # criteria provided, multiple submitters, no conflicts" — into
+        # "Pathogenic, High (ClinVar)" for a variant a third of the population
+        # carries.
         mv_clinvar = myvariant_data.get('clinvar')
         found_clinvar = False
-        
-        if mv_clinvar and 'rcv' in mv_clinvar:
+
+        aggregate = (clinvar_data or {}).get("clinical_significance") if clinvar_data and "error" not in clinvar_data else None
+
+        if aggregate:
+            classification = str(aggregate)
+            review = (clinvar_data or {}).get("review_status") or ""
+            confidence = f"High (ClinVar: {review})" if review else "High (ClinVar)"
+            evidence.append("ClinVar aggregate classification")
+            found_clinvar = True
+
+        elif mv_clinvar and 'rcv' in mv_clinvar:
             rcvs = mv_clinvar['rcv']
             if not isinstance(rcvs, list):
                 rcvs = [rcvs]
-                
-            # Try to find a pathogenic classification first
-            for rcv in rcvs:
-                if 'pathogenic' in str(rcv.get('clinical_significance', '')).lower():
-                    classification = "Pathogenic"
-                    break
-                    
-            if classification == "Variant of Uncertain Significance":
-                # Take the first one if no pathogenic found
-                classification = str(rcvs[0].get('clinical_significance', 'Uncertain'))
-                
-            confidence = "High (ClinVar)"
-            evidence.append("ClinVar database")
-            found_clinvar = True
-            
-        # Fallback to direct ClinVar E-utils data
-        elif clinvar_data and "error" not in clinvar_data and clinvar_data.get("clinical_significance"):
-            classification = clinvar_data.get('clinical_significance', 'Uncertain')
-            confidence = "High (ClinVar)"
-            evidence.append("ClinVar database")
-            found_clinvar = True
+
+            sigs = [str(r.get('clinical_significance', '')).strip() for r in rcvs]
+            sigs = [x for x in sigs if x]
+
+            # No aggregate available, so report what the submitters actually say:
+            # the most frequent call, and flag it as unreviewed rather than
+            # borrowing ClinVar's "High" confidence for a raw submission tally.
+            if sigs:
+                from collections import Counter
+                tally = Counter(sigs)
+                classification = tally.most_common(1)[0][0]
+                distinct = len(tally)
+                confidence = (
+                    f"Moderate (ClinVar submissions, {len(sigs)} records, no consensus)"
+                    if distinct > 1 else
+                    f"Moderate (ClinVar submissions, {len(sigs)} records)"
+                )
+                evidence.append(f"ClinVar submissions: {dict(tally)}")
+                found_clinvar = True
             
         if found_clinvar:
-            # Map classification to score
-            if "pathogenic" in classification.lower():
-                score = 0.9 if "likely" in classification.lower() else 1.0
-            elif "benign" in classification.lower():
-                score = 0.1 if "likely" in classification.lower() else 0.0
+            # Same substring trap as above: "pathogenicity" contains "pathogenic",
+            # so a conflicting-interpretations call used to score a flat 1.0.
+            # Conflicts are genuinely uncertain and must land in the middle.
+            lowered = classification.lower()
+            if "conflict" in lowered:
+                score = 0.5
+            elif "pathogenic" in lowered.replace("pathogenicity", ""):
+                score = 0.9 if "likely" in lowered else 1.0
+            elif "benign" in lowered:
+                score = 0.1 if "likely" in lowered else 0.0
             else:
                 score = 0.5
         

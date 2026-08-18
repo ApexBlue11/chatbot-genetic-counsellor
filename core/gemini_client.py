@@ -139,9 +139,16 @@ def _model_rank(name: str) -> tuple:
 # reasoning indefinitely.
 MAX_OUTPUT_TOKENS = int(os.getenv("VARIANTMIND_MAX_OUTPUT_TOKENS", "6144"))
 
+# Budget used when the counselor turns Thinking mode on. The cap above is what
+# makes a routine answer quick; deliberately raising it is the only way to buy
+# the model room to reason, since this SDK exposes no thinking_config. The
+# trade is real — expect a noticeably longer wait — so it is the user's call,
+# not a default.
+THINKING_OUTPUT_TOKENS = int(os.getenv("VARIANTMIND_THINKING_OUTPUT_TOKENS", "16384"))
 
-def _generation_config() -> Dict[str, Any]:
-    return {"max_output_tokens": MAX_OUTPUT_TOKENS}
+
+def _generation_config(thinking: bool = False) -> Dict[str, Any]:
+    return {"max_output_tokens": THINKING_OUTPUT_TOKENS if thinking else MAX_OUTPUT_TOKENS}
 
 
 # Models that returned 429 recently, so a request does not keep paying a round
@@ -171,7 +178,7 @@ def _fallback_models() -> List[str]:
     return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
 
 
-def generate_with_fallback(genai, prompt: str, on_status=None) -> Tuple[str, str]:
+def generate_with_fallback(genai, prompt: str, on_status=None, thinking: bool = False) -> Tuple[str, str]:
     models = discover_text_models(genai)
     last_error = None
     for model_name in models:
@@ -181,7 +188,7 @@ def generate_with_fallback(genai, prompt: str, on_status=None) -> Tuple[str, str
             if on_status:
                 on_status(f"Querying `{model_name}`...")
             model = genai.GenerativeModel(
-                model_name, generation_config=_generation_config()
+                model_name, generation_config=_generation_config(thinking)
             )
             response = model.generate_content(prompt)
             return response.text, model_name
@@ -553,7 +560,7 @@ def set_current_conv_id(conv_id: str):
 
 # ── Agent Loop ──
 
-def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+def generate_with_agent(genai, prompt: str, on_status=None, thinking: bool = False) -> Tuple[str, str, Optional[Dict[str, Any]]]:
     """
     Query Gemini with all registered tools available for autonomous calling.
     Returns (response_text, model_used, metadata).
@@ -579,7 +586,7 @@ def generate_with_agent(genai, prompt: str, on_status=None) -> Tuple[str, str, O
 
             model = genai.GenerativeModel(
                 model_name=model_name, tools=tools,
-                generation_config=_generation_config(),
+                generation_config=_generation_config(thinking),
             )
             chat = model.start_chat(enable_automatic_function_calling=True)
             response = chat.send_message(prompt)

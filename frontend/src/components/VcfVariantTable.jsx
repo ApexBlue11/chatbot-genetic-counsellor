@@ -12,6 +12,39 @@ const categoryConfig = {
   benign:          { label: 'Benign / Likely Benign',                icon: <CheckCircle size={16} />,   color: '#10B981', bg: '#D1FAE5' },
 };
 
+// A variant can be filed under Pathogenic/Dangerous purely because VEP scored
+// its impact HIGH, with no ClinVar call at all. The prioritiser already computes
+// impact, SIFT, PolyPhen and allele frequency; the table used to drop all four,
+// leaving the counselor no way to see why a row was ranked where it was.
+const IMPACT_COLORS = {
+  HIGH:     { color: '#EF4444', bg: '#FEE2E2' },
+  MODERATE: { color: '#F59E0B', bg: '#FEF3C7' },
+  LOW:      { color: '#10B981', bg: '#D1FAE5' },
+  MODIFIER: { color: '#6B7280', bg: '#F3F4F6' },
+};
+
+// SIFT and PolyPhen arrive as dbNSFP's single-letter codes.
+const SIFT_LABELS = { D: 'Deleterious', T: 'Tolerated' };
+const POLYPHEN_LABELS = { D: 'Probably damaging', P: 'Possibly damaging', B: 'Benign' };
+
+const expandPred = (raw, labels) => {
+  const v = String(raw ?? '').trim();
+  if (!v || v === '.' || v === 'None') return null;
+  // Multi-transcript calls come through as "D;D;T" — report the worst.
+  const codes = v.split(/[;,]/).map(c => c.trim()).filter(Boolean);
+  const worst = codes.find(c => c === 'D') || codes.find(c => c === 'P') || codes[0];
+  return labels[worst] || worst;
+};
+
+// Frequencies span many orders of magnitude, so a fixed number of decimal places
+// renders the rare ones — the clinically interesting ones — as a row of zeros.
+const formatAf = (af) => {
+  const n = Number(af);
+  if (af === null || af === undefined || af === '' || Number.isNaN(n)) return '—';
+  if (n === 0) return '0';
+  return n < 0.001 ? n.toExponential(2) : n.toFixed(4);
+};
+
 function VcfVariantTable({ prioritized, onVariantClick }) {
   const [expandedRows,   setExpandedRows]   = useState({});
   const [variantDetails, setVariantDetails] = useState({});
@@ -118,6 +151,9 @@ function VcfVariantTable({ prioritized, onVariantClick }) {
                     <th style={{ padding: '0.75rem 1rem' }}>Location</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Change</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Clinical Sig.</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Impact</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Predictors</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>gnomAD AF</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -168,11 +204,47 @@ function VcfVariantTable({ prioritized, onVariantClick }) {
                               {variant.clinical_sig || 'N/A'}
                             </span>
                           </td>
+                          <td style={{ padding: '0.75rem 1rem' }}>
+                            {variant.impact ? (
+                              <span style={{
+                                padding: '2px 8px', borderRadius: '12px', fontSize: '0.75rem', fontWeight: 500,
+                                background: (IMPACT_COLORS[variant.impact] || IMPACT_COLORS.MODIFIER).bg,
+                                color: (IMPACT_COLORS[variant.impact] || IMPACT_COLORS.MODIFIER).color,
+                              }}>
+                                {variant.impact}
+                              </span>
+                            ) : <span style={{ color: 'var(--text-secondary)' }}>—</span>}
+                          </td>
+                          <td style={{ padding: '0.75rem 1rem', fontSize: '0.75rem' }}>
+                            {(() => {
+                              const sift = expandPred(variant.sift, SIFT_LABELS);
+                              const pp = expandPred(variant.polyphen, POLYPHEN_LABELS);
+                              if (!sift && !pp) {
+                                return (
+                                  <span
+                                    style={{ color: 'var(--text-secondary)' }}
+                                    title="dbNSFP scores missense SNVs only, so indels and non-coding variants have none."
+                                  >
+                                    —
+                                  </span>
+                                );
+                              }
+                              return (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                  {sift && <span title="SIFT">SIFT: {sift}</span>}
+                                  {pp && <span title="PolyPhen-2 HDIV">PolyPhen: {pp}</span>}
+                                </div>
+                              );
+                            })()}
+                          </td>
+                          <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', fontSize: '0.75rem' }}>
+                            {formatAf(variant.af)}
+                          </td>
                         </tr>
 
                         {isExpanded && (
                           <tr style={{ background: '#fcfcfc', borderBottom: `2px solid ${config.color}` }}>
-                            <td colSpan={7} style={{ padding: 0 }}>
+                            <td colSpan={10} style={{ padding: 0 }}>
                               <div style={{ padding: '1rem', borderLeft: `3px solid ${config.color}` }}>
                                 {isLoading ? (
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>

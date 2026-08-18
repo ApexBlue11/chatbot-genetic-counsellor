@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ArrowRight, X, Paperclip, Sparkles, Activity, GitBranch, Dna, UserCircle, Loader2, Send } from "lucide-react";
+import { ArrowRight, X, Paperclip, Sparkles, Activity, GitBranch, Brain, Dna, UserCircle, Loader2, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -56,6 +56,8 @@ export interface SmartPasteInputProps {
   svEnabled?: boolean;
   onSvEnabledChange?: (val: boolean) => void;
   pedEnabled?: boolean;
+  thinkingEnabled?: boolean;
+  onThinkingEnabledChange?: (v: boolean) => void;
   onPedEnabledChange?: (val: boolean) => void;
 }
 
@@ -153,6 +155,8 @@ export function SmartPasteInput({
   svEnabled = true,
   onSvEnabledChange,
   pedEnabled = false,
+  thinkingEnabled = false,
+  onThinkingEnabledChange,
   onPedEnabledChange,
 }: SmartPasteInputProps) {
   const [text, setText] = useControllable(value, defaultValue, onValueChange);
@@ -374,6 +378,18 @@ export function SmartPasteInput({
               icon={<GitBranch className="w-3.5 h-3.5" />}
               label="Pedigree Tool"
               title="Toggle Pedigree Generation"
+            />
+            {/* Thinking Toggle */}
+            <ToggleButton
+              active={thinkingEnabled}
+              onClick={() => onThinkingEnabledChange?.(!thinkingEnabled)}
+              icon={<Brain className="w-3.5 h-3.5" />}
+              label="Thinking"
+              title={
+                thinkingEnabled
+                  ? "Thinking on: the model reasons at length and shows its clinical reasoning. Answers take longer."
+                  : "Thinking off: faster answers, without the reasoning write-up."
+              }
             />
           </div>
 

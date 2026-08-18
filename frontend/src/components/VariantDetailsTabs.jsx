@@ -10,9 +10,17 @@ function VariantDetailsTabs({ data }) {
 
   // Extract VEP data
   const vepData = raw.vep_data && raw.vep_data.length > 0 ? raw.vep_data[0] : null;
-  const primaryTranscript = vepData?.transcript_consequences?.find(t => 
-    t.flags?.includes('MANE_SELECT') || t.canonical === 1
-  ) || vepData?.transcript_consequences?.[0];
+  // VEP marks the MANE transcript with a `mane_select` field carrying the NM_
+  // accession — not a "MANE_SELECT" entry in `flags`. That check could never
+  // match, so this silently fell through to whichever transcript Ensembl listed
+  // first: for BRCA1 rs80357906, ENST00000352993 rather than the
+  // ENST00000357654 / NM_007294.4 record ClinVar reports against.
+  const transcripts = vepData?.transcript_consequences || [];
+  const primaryTranscript =
+    transcripts.find(t => t.mane_select) ||
+    transcripts.find(t => t.flags?.includes('MANE_SELECT')) ||
+    transcripts.find(t => t.canonical === 1) ||
+    transcripts[0];
 
   // Extract ClinVar data
   const clinvar = raw.clinvar_data || {};
@@ -54,8 +62,15 @@ function VariantDetailsTabs({ data }) {
     { name: 'South Asian', value: getAfVal('af_sas') },
   ].filter(d => d.value !== undefined && d.value !== null);
 
-  // Check if it's an indel (length of ref/alt differ or contains del/ins)
-  const isIndel = data.variant_id && (data.variant_id.includes('del') || data.variant_id.includes('ins') || (primaryTranscript?.amino_acids && primaryTranscript.amino_acids.includes('-')));
+  // An rsID never contains "del" or "ins", so keying off the query string meant
+  // this note never appeared for the exact case it exists to explain: an indel
+  // looked up by rsID, where dbNSFP legitimately has nothing to show. The
+  // consequence terms say what the variant is regardless of how it was asked for.
+  const consequenceText = (primaryTranscript?.consequence_terms || []).join(' ');
+  const isIndel =
+    /frameshift|inframe|insertion|deletion/.test(consequenceText) ||
+    /del|ins|dup/.test(data.variant_id || '') ||
+    !!primaryTranscript?.amino_acids?.includes('-');
 
   const AMINO_ACIDS_MAP = {
     'A': 'Ala', 'R': 'Arg', 'N': 'Asn', 'D': 'Asp', 'C': 'Cys',
@@ -63,6 +78,14 @@ function VariantDetailsTabs({ data }) {
     'L': 'Leu', 'K': 'Lys', 'M': 'Met', 'F': 'Phe', 'P': 'Pro',
     'S': 'Ser', 'T': 'Thr', 'W': 'Trp', 'Y': 'Tyr', 'V': 'Val',
     'X': 'Term', '*': 'Term'
+  };
+
+  // hgvsp arrives as "ENSP00000350283.3:p.Gln1756ProfsTer74" — the accession is
+  // noise next to the transcript row directly above it. Preferred over the bare
+  // amino-acid pair, which renders a frameshift as the unreadable "S/SX".
+  const formatProteinChange = (t) => {
+    const hgvsp = t?.hgvsp ? decodeURIComponent(t.hgvsp).split(':').pop() : null;
+    return hgvsp || formatAminoAcids(t?.amino_acids);
   };
 
   const formatAminoAcids = (aaStr) => {
@@ -77,6 +100,23 @@ function VariantDetailsTabs({ data }) {
     }
     return aaStr;
   };
+
+  // The backend's ClinVar summary carries `conditions` as a plain string list.
+  // `trait_set` is an eutils shape it never returns, so the old lookup always
+  // fell through to the MyVariant fallback and printed 1 of the 16 submitted
+  // conditions — while the authoritative list sat unread in the same object.
+  const clinvarConditions = (() => {
+    if (Array.isArray(clinvar.conditions) && clinvar.conditions.length) return clinvar.conditions;
+    if (typeof clinvar.conditions === 'string' && clinvar.conditions) return [clinvar.conditions];
+    if (clinvar.trait_set?.length) return clinvar.trait_set.map(t => t.trait_name);
+    const rcv = mvData?.clinvar?.rcv;
+    const list = Array.isArray(rcv) ? rcv : rcv ? [rcv] : [];
+    const names = list.flatMap(r => {
+      const n = r.conditions?.name;
+      return Array.isArray(n) ? n : n ? [n] : [];
+    });
+    return [...new Set(names)];
+  })();
 
   const handleDownloadJSON = () => {
     const blob = new Blob([JSON.stringify(raw, null, 2)], { type: 'application/json' });
@@ -121,6 +161,12 @@ function VariantDetailsTabs({ data }) {
                 <div>
                   <div style={{ color: 'var(--text-secondary)' }}>Transcript ID</div>
                   <div>{primaryTranscript.transcript_id}</div>
+                  {/* The RefSeq accession is the one ClinVar and the report use. */}
+                  {primaryTranscript.mane_select && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--primary)' }}>
+                      MANE Select · {primaryTranscript.mane_select}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div style={{ color: 'var(--text-secondary)' }}>Gene Name</div>
@@ -133,8 +179,8 @@ function VariantDetailsTabs({ data }) {
                   </div>
                 </div>
                 <div>
-                  <div style={{ color: 'var(--text-secondary)' }}>Amino Acid Change</div>
-                  <div>{formatAminoAcids(primaryTranscript.amino_acids)}</div>
+                  <div style={{ color: 'var(--text-secondary)' }}>Protein Change</div>
+                  <div>{formatProteinChange(primaryTranscript)}</div>
                 </div>
                 <div>
                   <div style={{ color: 'var(--text-secondary)' }}>Impact</div>
@@ -166,11 +212,7 @@ function VariantDetailsTabs({ data }) {
                 </div>
                 <div style={{ gridColumn: '1 / -1' }}>
                   <div style={{ color: 'var(--text-secondary)' }}>Associated Conditions</div>
-                  <div>
-                    {clinvar.trait_set?.map(t => t.trait_name).join(', ') 
-                      || (Array.isArray(mvData?.clinvar?.rcv) ? mvData.clinvar.rcv[0]?.conditions?.name : mvData?.clinvar?.rcv?.conditions?.name)
-                      || 'N/A'}
-                  </div>
+                  <div>{clinvarConditions.length ? clinvarConditions.join(', ') : 'N/A'}</div>
                 </div>
               </div>
             ) : (

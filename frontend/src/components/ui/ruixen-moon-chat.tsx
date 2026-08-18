@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from "react";
 import { cn } from "@/lib/utils";
-import { Bot, Loader2, Dna, GitBranch, Activity, Upload } from "lucide-react";
+import { Loader2, Dna, GitBranch, Activity, Upload } from "lucide-react";
 import api from "../../services/api";
 import MessageBubble from "../MessageBubble";
 import ThinkingIndicator from "../ThinkingIndicator";
@@ -27,6 +27,16 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
   const [aiEnabled, setAiEnabled] = useState(true);
   const [svEnabled, setSvEnabled] = useState(true);
   const [pedEnabled, setPedEnabled] = useState(false);
+  // Thinking mode is a preference about how you want to be answered, not a
+  // property of one conversation — someone who wants the reasoning shown
+  // wants it on the next question too, and after a reload.
+  const [thinkingEnabled, setThinkingEnabled] = useState(
+    () => localStorage.getItem("vm_thinking") === "1"
+  );
+
+  useEffect(() => {
+    localStorage.setItem("vm_thinking", thinkingEnabled ? "1" : "0");
+  }, [thinkingEnabled]);
 
   const endOfMessagesRef = useRef<HTMLDivElement>(null);
   const currentConvRef = useRef<string | null>(activeConversation);
@@ -143,7 +153,8 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
             true,
             svEnabled,
             pedEnabled,
-            systemContext
+            systemContext,
+            thinkingEnabled
           );
           if (currentConvRef.current !== reqConv) return;
           setMessages((prev) => [
@@ -160,7 +171,8 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
             true,
             svEnabled,
             pedEnabled,
-            null
+            null,
+            thinkingEnabled
           );
           if (currentConvRef.current !== reqConv) return;
           setMessages((prev) => [
@@ -273,9 +285,14 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
                 className={cn(
                   // Translucent + heavily frosted: the backdrop stays visible
                   // through the bubble, just blurred enough to keep text crisp.
+                  // Both turns are the same frosted glass. The user bubble used
+                  // to be a flat blue-500/15 wash, which read as an opaque
+                  // panel next to the assistant's frost instead of a sibling
+                  // of it; the blue now lives in the tint and the edge, and
+                  // the side of the column still says who is speaking.
                   "rounded-2xl border p-5 backdrop-blur-xl transition-all duration-300",
                   msg.role === "user"
-                    ? "ml-auto max-w-[85%] border-blue-400/30 bg-blue-500/15 shadow-lg shadow-blue-950/30"
+                    ? "ml-auto max-w-[85%] border-blue-300/20 bg-blue-950/40 shadow-lg shadow-black/30"
                     : "mr-auto max-w-[92%] border-white/10 bg-slate-950/40 shadow-lg shadow-black/30"
                 )}
               >
@@ -283,11 +300,8 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
               </div>
             ))}
             {loading && (
-              <div className="mr-auto flex max-w-[92%] items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/40 p-5 shadow-lg shadow-black/30 backdrop-blur-xl">
-                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/20 text-emerald-400">
-                  <Bot size={18} />
-                </div>
-                <ThinkingIndicator />
+              <div className="mr-auto flex max-w-[92%] items-center rounded-2xl border border-white/10 bg-slate-950/40 p-5 shadow-lg shadow-black/30 backdrop-blur-xl">
+                <ThinkingIndicator deep={thinkingEnabled} />
               </div>
             )}
             <div ref={endOfMessagesRef} />
@@ -343,6 +357,8 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
           onSvEnabledChange={setSvEnabled}
           pedEnabled={pedEnabled}
           onPedEnabledChange={setPedEnabled}
+          thinkingEnabled={thinkingEnabled}
+          onThinkingEnabledChange={setThinkingEnabled}
           onSubmit={handleSmartSubmit}
           disabled={loading}
           className="max-w-full"

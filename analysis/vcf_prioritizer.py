@@ -266,14 +266,23 @@ class VCFPrioritizer:
         sift = str(parsed.get("sift", "")).lower()
         polyphen = str(parsed.get("polyphen", "")).lower()
 
-        if ("pathogenic" in sig and "benign" not in sig) or impact == "HIGH":
+        # "pathogenic" is a substring of "pathogenicity", so ClinVar's very common
+        # "Conflicting interpretations of pathogenicity" used to satisfy the
+        # first branch and land in Pathogenic/Dangerous — and the "conflicting"
+        # branch below could never be reached. Conflicts are genuinely unsettled
+        # and belong in possibly_harmful, so test for them first.
+        sig_no_conflict = sig.replace("pathogenicity", "")
+
+        if "conflicting" in sig:
+            prioritized["possibly_harmful"].append(parsed)
+        elif ("pathogenic" in sig_no_conflict and "benign" not in sig) or impact == "HIGH":
             prioritized["dangerous"].append(parsed)
         elif "benign" in sig:
             prioritized["benign"].append(parsed)
         elif "uncertain" in sig or "vus" in sig:
             prioritized["vus"].append(parsed)
         elif ("deleterious" in sift or "damaging" in polyphen
-              or impact == "MODERATE" or "conflicting" in sig):
+              or impact == "MODERATE"):
             prioritized["possibly_harmful"].append(parsed)
         elif sig in ("not annotated", ""):
             prioritized["unannotated"].append(parsed)

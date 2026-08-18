@@ -854,3 +854,143 @@ input, textarea {
   .thinking-orb-ring,
   .thinking-dots i { animation: none; }
 }
+
+/* ── Message header ────────────────────────────────────────────────────────
+   Every turn already sits in its own frosted bubble, so the header only has to
+   name the speaker. The assistant carries the thinking indicator's orb — the
+   same mark, held still, because the motion is what separates a reply still
+   being written from one that has landed. The user gets no mark at all: their
+   bubble is the right-aligned one, which says whose turn it is without a
+   second filled square competing with the text. */
+.msg {
+  width: 100%;
+}
+
+.msg-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
+/* Mirrors the assistant's left-aligned label on a right-aligned bubble. */
+.msg--user .msg-head {
+  justify-content: flex-end;
+}
+
+.msg-who {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(203, 213, 225, 0.72);
+}
+
+.msg--user .msg-who {
+  color: rgba(191, 219, 254, 0.78);
+}
+
+.msg-orb {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.msg-orb-core {
+  position: absolute;
+  inset: 3.5px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #60a5fa, #6366f1);
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.55);
+}
+
+.msg-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(96, 165, 250, 0.38);
+  border-top-color: rgba(147, 197, 253, 0.9);
+}
+
+/* ── Collapsed reasoning ───────────────────────────────────────────────────
+   The "Clinical Thinking Process" block the model emits with Thinking mode on.
+   It arrives as a bare <details>, which browsers render as an unstyled
+   disclosure triangle floating in the bubble; it is the part a counselor
+   actually audits, so it gets a surface of its own. */
+.markdown-body details {
+  margin: 0 0 0.85rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 0.65rem;
+  background: rgba(15, 23, 42, 0.45);
+  overflow: hidden;
+}
+
+.markdown-body summary {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.8rem;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #bfdbfe;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.markdown-body summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Own triangle, so it can rotate on open — the native marker cannot. */
+.markdown-body summary::before {
+  content: '';
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.2s ease;
+}
+
+.markdown-body details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.markdown-body summary:hover {
+  background: rgba(148, 163, 184, 0.08);
+  color: #dbeafe;
+}
+
+.markdown-body details[open] > summary {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.markdown-body details > *:not(summary) {
+  margin-left: 0.8rem;
+  margin-right: 0.8rem;
+}
+
+.markdown-body details > *:not(summary):first-of-type {
+  margin-top: 0.7rem;
+}
+
+.markdown-body details > *:not(summary):last-child {
+  margin-bottom: 0.7rem;
+}
+
+/* Mode badge on the in-flight indicator, so a long wait is legibly the price
+   of Thinking mode rather than the app having stalled. */
+.thinking-mode {
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  background: rgba(59, 130, 246, 0.14);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #bfdbfe;
+}

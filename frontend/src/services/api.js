@@ -81,7 +81,15 @@ const api = {
 
   getMessages: (id) => request(`/conversations/${id}/messages`),
 
-  sendMessage: (conversationId, userInput, aiEnabled, svEnabled, pedEnabled = false, systemContext = null) =>
+  sendMessage: (
+    conversationId,
+    userInput,
+    aiEnabled,
+    svEnabled,
+    pedEnabled = false,
+    systemContext = null,
+    thinkingEnabled = false
+  ) =>
     request('/chat/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -91,6 +99,7 @@ const api = {
         ai_enabled: aiEnabled,
         sv_enabled: svEnabled,
         ped_enabled: pedEnabled,
+        thinking_enabled: thinkingEnabled,
         system_context: systemContext,
       }),
     }),

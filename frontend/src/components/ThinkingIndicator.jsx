@@ -21,7 +21,21 @@ const STAGES = [
   { at: 70, label: 'Composing the answer' },
 ];
 
-export default function ThinkingIndicator() {
+// Thinking mode buys the model room to reason before it answers, so the same
+// request takes substantially longer. The stages have to stretch to match:
+// labels that run out and then sit on "Composing the answer" for another
+// minute are worse than no labels at all.
+const DEEP_STAGES = [
+  { at: 0, label: 'Reading your question' },
+  { at: 6, label: 'Checking variant databases' },
+  { at: 18, label: 'Searching the literature' },
+  { at: 34, label: 'Cross-referencing findings' },
+  { at: 55, label: 'Weighing the evidence' },
+  { at: 85, label: 'Working through the reasoning' },
+  { at: 130, label: 'Writing up the reasoning' },
+];
+
+export default function ThinkingIndicator({ deep = false }) {
   const [elapsed, setElapsed] = useState(0);
   const started = useRef(Date.now());
 
@@ -33,11 +47,13 @@ export default function ThinkingIndicator() {
     return () => clearInterval(id);
   }, []);
 
+  const stages = deep ? DEEP_STAGES : STAGES;
+
   const stage = useMemo(() => {
-    let current = STAGES[0];
-    for (const s of STAGES) if (elapsed >= s.at) current = s;
+    let current = stages[0];
+    for (const s of stages) if (elapsed >= s.at) current = s;
     return current;
-  }, [elapsed]);
+  }, [elapsed, stages]);
 
   return (
     <div className="thinking" role="status" aria-live="polite">
@@ -47,6 +63,10 @@ export default function ThinkingIndicator() {
       </span>
 
       <span className="thinking-label">{stage.label}</span>
+
+      {/* The composer toggle is behind the message list while you wait, so say
+          here which mode this answer is being written in. */}
+      {deep && <span className="thinking-mode">Thinking</span>}
 
       <span className="thinking-dots" aria-hidden="true">
         <i /><i /><i />

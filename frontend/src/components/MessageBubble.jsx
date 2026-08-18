@@ -1,4 +1,4 @@
-import { User, Bot, ChevronDown, ChevronUp, X, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, X, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useState, useEffect } from 'react';
@@ -112,14 +112,21 @@ function MessageBubble({ message }) {
   };
 
   return (
-    <div className="message">
-      <div className={`message-avatar ${isUser ? 'avatar-user' : 'avatar-assistant'}`}>
-        {isUser ? <User size={18} /> : <Bot size={18} />}
+    <div className={`msg ${isUser ? 'msg--user' : 'msg--assistant'}`}>
+      {/* The assistant is marked by the same orb the thinking indicator pulses
+          with, so the finished reply lands under the mark the reader was just
+          watching. The user's own turns need no mark: they are the ones the
+          bubble aligns right, and a second filled square only added noise. */}
+      <div className="msg-head">
+        {!isUser && (
+          <span className="msg-orb" aria-hidden="true">
+            <span className="msg-orb-core" />
+            <span className="msg-orb-ring" />
+          </span>
+        )}
+        <span className="msg-who">{isUser ? 'You' : 'VariantMind'}</span>
       </div>
       <div className="message-content">
-        <div style={{ fontWeight: 600, marginBottom: '0.25rem', fontSize: '0.85rem', color: isUser ? 'var(--primary)' : '#10B981' }}>
-          {isUser ? 'You' : 'VariantMind'}
-        </div>
         
         {content && (
            <div className="markdown-body" style={{ color: 'var(--text-primary)' }}>

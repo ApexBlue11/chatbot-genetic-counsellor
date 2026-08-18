@@ -166,8 +166,16 @@ def query_vep(hgvs: str) -> Dict[str, Any]:
         else:
             url = f"{VEP_BASE}/{quote(clean_hgvs, safe='')}"
 
-        log_api_step("VEP_HTTP_REQUEST", f"GET Request to: {url}")
-        resp = requests.get(url, headers=headers, timeout=30)
+        # Ensembl omits these annotations unless they are asked for. Without
+        # them every transcript comes back unflagged, so a caller trying to pick
+        # "the primary transcript" has nothing to pick on and falls back to
+        # whichever one Ensembl happened to list first — for BRCA1 rs80357906
+        # that is ENST00000352993, not the ENST00000357654 / NM_007294.4 record
+        # ClinVar actually reports against. mane_select ties the two together;
+        # hgvs adds the c. and p. notation the counselor reads.
+        params = {"canonical": 1, "mane": 1, "hgvs": 1}
+        log_api_step("VEP_HTTP_REQUEST", f"GET Request to: {url} with params {params}")
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
         
         log_api_step("VEP_HTTP_RESPONSE", f"HTTP Status: {resp.status_code}")
         resp.raise_for_status()
@@ -216,15 +224,25 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
             log_api_step("CLINVAR_SEARCH_EMPTY", f"No ClinVar records found for term: '{search_term}'")
             return {"error": "No ClinVar records found"}
         
-        # Step 2: Fetch summary for the first ID found
+        # Step 2: Fetch summaries for every candidate, not just the first.
+        #
+        # ClinVar's free-text search matches an rsID anywhere in a record, so the
+        # first hit is frequently a different variant in a different gene. For
+        # rs1801133 (MTHFR c.665C>T) esearch returns 128852, 3522, 3521, 3520 —
+        # and 128852 is a CPS1 variant carrying rs1047891. Taking id_list[0]
+        # meant the app reported CPS1's classification, CPS1's conditions
+        # ("Congenital hyperammonemia, type I") and CPS1's protein change for an
+        # MTHFR query, then fed all of it to the model as retrieved fact.
+        # Below, the record is chosen by matching the dbSNP cross-reference.
+        candidate_ids = id_list[:10]
         summary_url = f"{CLINVAR_BASE}/esummary.fcgi"
         summary_params = {
             "db": "clinvar",
-            "id": id_list[0],
+            "id": ",".join(candidate_ids),
             "retmode": "json"
         }
         
-        log_api_step("CLINVAR_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for ID: {id_list[0]}")
+        log_api_step("CLINVAR_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {candidate_ids}")
         summary_resp = requests.get(summary_url, params=summary_params, timeout=15)
         
         log_api_step("CLINVAR_SUMMARY_RESPONSE", f"HTTP Status: {summary_resp.status_code}")
@@ -233,7 +251,33 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
         log_api_step("CLINVAR_SUMMARY_RAW", "Raw esummary response payload", summary_data)
         
         result = summary_data.get("result", {})
-        target_id = id_list[0]
+
+        def _rsids_of(rec):
+            out = set()
+            for vset in rec.get("variation_set") or []:
+                for xref in vset.get("variation_xrefs") or []:
+                    if str(xref.get("db_source", "")).lower() == "dbsnp" and xref.get("db_id"):
+                        out.add(f"rs{str(xref['db_id']).lstrip('rs')}")
+            return out
+
+        target_id = candidate_ids[0]
+        if rsid:
+            wanted = f"rs{str(rsid).lower().lstrip('rs')}"
+            matched = next(
+                (cid for cid in candidate_ids
+                 if cid in result and wanted in _rsids_of(result[cid])),
+                None,
+            )
+            if matched:
+                target_id = matched
+                log_api_step("CLINVAR_RSID_MATCH", f"Selected ClinVar ID {matched} by dbSNP xref {wanted}")
+            else:
+                # Better to report nothing than to report a different variant's
+                # classification as though it belonged to the one asked for.
+                log_api_step("CLINVAR_RSID_NO_MATCH",
+                             f"No ClinVar record cross-references {wanted}; candidates were {candidate_ids}")
+                return {"error": f"No ClinVar record cross-referencing {wanted}"}
+
         if target_id in result:
             record = result[target_id]
             

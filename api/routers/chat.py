@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     ai_enabled: bool = True
     sv_enabled: bool = True
     ped_enabled: bool = False
+    thinking_enabled: bool = False
     system_context: Optional[str] = None
 
     def get_user_input(self) -> str:
@@ -73,9 +74,13 @@ def send_message(req: ChatRequest, session_id: str = Depends(require_session)):
         hgvs = detect_hgvs(user_input)
         if (rsid or hgvs) and not _needs_agent(user_input):
             variant_id = rsid or hgvs
-            return handle_single_variant(variant_id, user_input, conversation_id, req.ai_enabled)
+            return handle_single_variant(
+                variant_id, user_input, conversation_id, req.ai_enabled, req.thinking_enabled
+            )
 
-    return handle_ai_chat(user_input, conversation_id, req.ped_enabled, req.system_context)
+    return handle_ai_chat(
+        user_input, conversation_id, req.ped_enabled, req.system_context, req.thinking_enabled
+    )
 
 
 # Cues that a request needs more than a single-variant lookup, and so must go
@@ -199,7 +204,8 @@ def _build_vcf_context_for_prompt(conversation_id: str) -> tuple[str, str]:
 
 # ── Main AI chat handler ──
 
-def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_context=None):
+def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_context=None,
+                   thinking_enabled=False):
     genai = init_gemini()
     if not genai:
         raise HTTPException(status_code=500, detail="Gemini API not configured")
@@ -299,13 +305,29 @@ def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_contex
         "prior knowledge without labelling it as general knowledge rather than a lookup."
     )
 
+    # Rule 1 is the half of Thinking mode the counselor can see: on, they get the
+    # reasoning to audit; off, they get the finding without the deliberation.
+    if thinking_enabled:
+        reasoning_rule = (
+            "1. Reason the case through step by step BEFORE concluding, and show that "
+            "work wrapped in:\n"
+            "   <details><summary>Clinical Thinking Process</summary>\n"
+            "   ... reasoning ...\n"
+            "   </details>\n"
+            "   Weigh the evidence explicitly: which predictors agree, which conflict, "
+            "what the population frequency implies, and what would change your call. "
+            "Then present your final answer clearly after the closing tag.\n"
+        )
+    else:
+        reasoning_rule = (
+            "1. Answer directly. Do NOT emit a "
+            "<details>Clinical Thinking Process</details> block: give the conclusion and "
+            "the evidence behind it without narrating your deliberation.\n"
+        )
+
     system_parts.append(
         "CRITICAL RESPONSE RULES:\n"
-        "1. ALWAYS wrap your step-by-step clinical reasoning in:\n"
-        "   <details><summary>Clinical Thinking Process</summary>\n"
-        "   ... reasoning ...\n"
-        "   </details>\n"
-        "   Then present your final answer clearly after the closing tag.\n"
+        + reasoning_rule +
         "2. NEVER hallucinate literature — only cite papers returned by search_pubmed.\n"
         "3. When summarising multiple variants, output a Markdown table: Variant ID | Gene | "
         "Protein Effect | Pathogenicity | Associated Conditions.\n"
@@ -343,7 +365,8 @@ def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_contex
 
 # ── Single Variant Handler ──
 
-def handle_single_variant(variant_id, user_input, conversation_id, ai_enabled):
+def handle_single_variant(variant_id, user_input, conversation_id, ai_enabled,
+                          thinking_enabled=False):
     classification = router_genomic.classify(variant_id)
     variant_data = fetcher.fetch_variant_data(
         variant_id=classification.extracted_identifier,
@@ -387,9 +410,13 @@ def handle_single_variant(variant_id, user_input, conversation_id, ai_enabled):
         genai = init_gemini()
         if genai:
             set_current_conv_id(conversation_id)
-            prompt = _build_variant_prompt(variant_id, gene, variant_data, analysis, user_input)
+            prompt = _build_variant_prompt(
+                variant_id, gene, variant_data, analysis, user_input, thinking_enabled
+            )
             try:
-                response_text, model_used = generate_with_fallback(genai, prompt)
+                response_text, model_used = generate_with_fallback(
+                    genai, prompt, thinking=thinking_enabled
+                )
                 summary += f"\n\n### 📋 AI Interpretation\n{response_text}\n\n*Model: {model_used}*"
             except Exception:
                 pass
@@ -417,7 +444,120 @@ def get_variant_details(variant_id: str):
     }
 
 
-def _build_variant_prompt(variant_id, gene, variant_data, analysis, user_input):
+def _first(val):
+    """dbNSFP repeats a score once per transcript; they are the same number."""
+    if isinstance(val, list):
+        for v in val:
+            if v not in (None, "", "."):
+                return v
+        return None
+    return val if val not in (None, "", ".") else None
+
+
+def _variant_evidence_block(variant_data, analysis) -> str:
+    """Curated evidence for the single-variant prompt.
+
+    This used to be `json.dumps(myvariant_data)[:2000]`. MyVariant records run
+    to ~100 kB for a well-studied variant, and the keys arrive alphabetically,
+    so 2,000 characters bought nothing but the interior of the `cadd` object —
+    mapability windows and distance-to-TSE. Every field a counselor cares about
+    (gnomad_genome, gnomad_exome, dbnsfp, exac) sat past the cut. The model was
+    therefore reasoning about frequencies and predictors it had never been
+    shown, for every variant, whether or not the lookup succeeded.
+    """
+    mv = variant_data.get("myvariant_data") or {}
+    dbnsfp = mv.get("dbnsfp") or {}
+    lines = []
+
+    # ── Population frequency ──
+    pop = analysis.get("population_frequency") or {}
+    if pop:
+        lines.append("POPULATION FREQUENCY (gnomAD):")
+        for label, rec in pop.items():
+            if not isinstance(rec, dict):
+                continue
+            af = rec.get("allele_frequency")
+            if af is None:
+                continue
+            lines.append(f"  {label}: {af:.6g} ({rec.get('percent', 0):.4g}%) [{rec.get('source', 'gnomAD')}]")
+    else:
+        lines.append("POPULATION FREQUENCY: not retrieved (no gnomAD record returned for this variant).")
+
+    # ── Functional predictors ──
+    sift = _first(dbnsfp.get("sift", {}).get("pred") if isinstance(dbnsfp.get("sift"), dict) else dbnsfp.get("sift_pred"))
+    sift_score = _first(dbnsfp.get("sift", {}).get("score") if isinstance(dbnsfp.get("sift"), dict) else dbnsfp.get("sift_score"))
+    pp2 = dbnsfp.get("polyphen2") or {}
+    hdiv = pp2.get("hdiv") if isinstance(pp2, dict) else {}
+    polyphen = _first(hdiv.get("pred") if isinstance(hdiv, dict) else dbnsfp.get("polyphen2_hdiv_pred"))
+    polyphen_score = _first(hdiv.get("score") if isinstance(hdiv, dict) else dbnsfp.get("polyphen2_hdiv_score"))
+    revel = _first((dbnsfp.get("revel") or {}).get("score") if isinstance(dbnsfp.get("revel"), dict) else dbnsfp.get("revel_score"))
+    cadd_obj = mv.get("cadd") or dbnsfp.get("cadd") or {}
+    cadd = _first(cadd_obj.get("phred") if isinstance(cadd_obj, dict) else None)
+
+    preds = []
+    if sift is not None:
+        preds.append(f"  SIFT: {sift}" + (f" (score {sift_score})" if sift_score is not None else "") + "  [<0.05 deleterious; missense only]")
+    if polyphen is not None:
+        preds.append(f"  PolyPhen-2 HDIV: {polyphen}" + (f" (score {polyphen_score})" if polyphen_score is not None else "") + "  [>0.85 probably damaging]")
+    if revel is not None:
+        preds.append(f"  REVEL: {revel}  [>0.75 likely pathogenic; most reliable missense ensemble]")
+    if cadd is not None:
+        preds.append(f"  CADD (Phred): {cadd}  [>20 top 1%, >30 top 0.1%; works for all variant types]")
+
+    if preds:
+        lines.append("FUNCTIONAL PREDICTORS (dbNSFP):")
+        lines.extend(preds)
+    else:
+        lines.append(
+            "FUNCTIONAL PREDICTORS: not retrieved. dbNSFP is trained on missense SNVs, "
+            "so frameshifts, indels and non-coding variants legitimately have no scores."
+        )
+
+    # ── ClinVar ──
+    cv = variant_data.get("clinvar_data") or {}
+    if cv and "error" not in cv:
+        lines.append("CLINVAR (aggregate):")
+        lines.append(f"  Classification: {cv.get('clinical_significance', 'N/A')}")
+        lines.append(f"  Review status: {cv.get('review_status', 'N/A')}")
+        conds = cv.get("conditions")
+        if conds:
+            lines.append(f"  Conditions: {', '.join(conds) if isinstance(conds, list) else conds}")
+        if cv.get("protein_change"):
+            lines.append(f"  Protein change: {cv['protein_change']}")
+        if cv.get("title"):
+            lines.append(f"  ClinVar title: {cv['title']}")
+    else:
+        lines.append("CLINVAR: no aggregate record retrieved.")
+
+    rcv = (mv.get("clinvar") or {}).get("rcv")
+    rcvs = rcv if isinstance(rcv, list) else ([rcv] if rcv else [])
+    if rcvs:
+        from collections import Counter
+        tally = Counter(str(r.get("clinical_significance", "")).strip() for r in rcvs if r.get("clinical_significance"))
+        lines.append(f"  Submitted interpretations ({len(rcvs)} records): " +
+                     "; ".join(f"{k} x{v}" for k, v in tally.most_common()))
+
+    return "\n".join(lines)
+
+
+def _build_variant_prompt(variant_id, gene, variant_data, analysis, user_input,
+                          thinking_enabled=False):
+    # Same split as the agent path: Thinking mode buys the audit trail and costs
+    # the wait; with it off the counselor wants the interpretation on its own.
+    if thinking_enabled:
+        closing = (
+            "Wrap your reasoning in:\n"
+            "<details><summary>Clinical Thinking Process</summary>\n"
+            "... reasoning ...\n"
+            "</details>\n"
+            "Then provide a clear clinical interpretation."
+        )
+    else:
+        closing = (
+            "Give a clear clinical interpretation directly. Do NOT emit a "
+            "<details>Clinical Thinking Process</details> block."
+        )
+
     prompt = f"""You are a clinical genetics expert. Interpret the following variant for a genetic counselor.
 Use Unicode symbols (Δ, α, β) instead of LaTeX. Do NOT format as a letter.
 
@@ -427,13 +567,15 @@ Pathogenicity: {analysis['pathogenicity_prediction']['classification']} ({analys
 Protein Effect: {analysis['functional_impact']['protein_effect']}
 Clinical Significance: {analysis.get('clinical_relevance', {}).get('clinical_significance', 'N/A')}
 
-Raw data summary:
-- MyVariant: {json.dumps(variant_data.get('myvariant_data', {}), indent=1)[:2000]}
-- ClinVar: {json.dumps(variant_data.get('clinvar_data', {}), indent=1)[:1000]}
+RETRIEVED EVIDENCE:
+{_variant_evidence_block(variant_data, analysis)}
 
-Wrap your reasoning in:
-<details><summary>Clinical Thinking Process</summary>
-... reasoning ...
-</details>
-Then provide a clear clinical interpretation."""
+GROUNDING: the block above is everything that was actually retrieved for this
+variant. If something is missing from it - no gnomAD frequencies, no predictor
+scores - say it was not retrieved rather than supplying the number from prior
+knowledge. General knowledge is fine when labelled as such; it must never be
+presented as a database lookup. This path does not call PubMed, so do not cite
+PMIDs as though a search returned them.
+
+{closing}"""
     return prompt
