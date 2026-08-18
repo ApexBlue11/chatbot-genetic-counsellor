@@ -62,14 +62,36 @@ def send_message(req: ChatRequest, session_id: str = Depends(require_session)):
         return {"response": msg, "metadata": {}}
 
     # ── sv_enabled: route single-variant queries through the deep analysis path ──
-    if req.sv_enabled and req.ai_enabled:
+    #
+    # Only for requests that are *only* about the variant. This fast path
+    # bypasses the agent loop entirely, so it has no pedigree tool and no
+    # PubMed access; taking it for a composite question ("draw the pedigree,
+    # look up this variant, find literature, then reason about it") silently
+    # dropped every other tool and left the model answering from memory.
+    if req.sv_enabled and req.ai_enabled and not req.ped_enabled:
         rsid = detect_rsid(user_input)
         hgvs = detect_hgvs(user_input)
-        if rsid or hgvs:
+        if (rsid or hgvs) and not _needs_agent(user_input):
             variant_id = rsid or hgvs
             return handle_single_variant(variant_id, user_input, conversation_id, req.ai_enabled)
 
     return handle_ai_chat(user_input, conversation_id, req.ped_enabled, req.system_context)
+
+
+# Cues that a request needs more than a single-variant lookup, and so must go
+# to the agent loop where the pedigree, literature and VCF tools live.
+_AGENT_CUES = (
+    "pedigree", "family history", "family tree", "draw the", "proband",
+    "literature", "pubmed", "paper", "publication", "cite", "citation",
+    "study", "studies", "recommend", "counsel", "risk of", "carrier risk",
+    "sibling", "brother", "sister", "parents", "pregnan", "inherit",
+)
+
+
+def _needs_agent(text: str) -> bool:
+    """True when the request asks for anything beyond one variant lookup."""
+    lowered = text.lower()
+    return any(cue in lowered for cue in _AGENT_CUES)
 
 
 # ── Context builders ──

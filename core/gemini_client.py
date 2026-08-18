@@ -85,10 +85,44 @@ def discover_text_models(genai) -> List[str]:
             m for m in all_discovered
             if 'gemini' in m.lower() and not any(kw in m.lower() for kw in exclude_keywords)
         ]
-        gemini_models.sort(reverse=True)
+        gemini_models.sort(key=_model_rank, reverse=True)
         return gemini_models if gemini_models else _fallback_models()
     except Exception:
         return _fallback_models()
+
+
+def _model_rank(name: str) -> tuple:
+    """Rank a model by capability, for choosing which to try first.
+
+    These names were previously sorted reverse-alphabetically, which is not a
+    capability order at all: "gemini-flash-lite-latest" sorts above
+    "gemini-flash-latest" (because "li" > "la") and above every "gemini-3.x"
+    (because "f" > "3"). The lite model therefore won the ranking and answered
+    complex requests — and lite models are markedly worse at multi-step tool
+    calling, so the agent would skip its tools and answer from memory while
+    still presenting the result as a database lookup.
+
+    Ordered by: tier (pro > flash > lite), then version, then stable > preview.
+    """
+    n = name.lower()
+
+    if 'lite' in n:
+        tier = 1
+    elif 'pro' in n:
+        tier = 3
+    elif 'flash' in n:
+        tier = 2
+    else:
+        tier = 0
+
+    version_match = re.search(r'(\d+(?:\.\d+)?)', n)
+    version = float(version_match.group(1)) if version_match else 0.0
+    # "latest" aliases carry no number but track the current release.
+    if 'latest' in n and version == 0.0:
+        version = 99.0
+
+    stable = 0 if any(k in n for k in ('preview', 'exp', 'experimental')) else 1
+    return (tier, stable, version)
 
 
 def _fallback_models() -> List[str]:
@@ -193,7 +227,10 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
         )
         analysis = analyzer.analyze_variant(variant_data)
 
-        return json.dumps({
+        frequencies = analysis.get("population_frequency") or {}
+        predictors = analysis.get("functional_impact", {}).get("predictor_scores") or {}
+
+        payload = {
             "variant": variant_id,
             "classification": classification.query_type,
             "pathogenicity": analysis["pathogenicity_prediction"]["classification"],
@@ -201,7 +238,31 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
             "protein_effect": analysis["functional_impact"]["protein_effect"],
             "clinical_significance": analysis.get("clinical_relevance", {}).get("clinical_significance", "N/A"),
             "associated_conditions": analysis.get("clinical_relevance", {}).get("associated_conditions", []),
-        }, indent=2)
+            "population_frequency": frequencies,
+            "predictor_scores": predictors,
+        }
+
+        # Say plainly what came back empty. Silence was being read as "not
+        # mentioned" rather than "not retrieved", and the model filled the gap
+        # from memory while still attributing it to this tool — a recalled
+        # gnomAD frequency printed under a database heading is exactly the
+        # failure this product claims to avoid.
+        missing = [name for name, value in (
+            ("gnomAD/population frequency", frequencies),
+            ("functional predictor scores", predictors),
+            ("associated conditions", payload["associated_conditions"]),
+        ) if not value]
+        if missing:
+            payload["data_not_retrieved"] = missing
+            payload["reporting_instruction"] = (
+                "The fields listed in data_not_retrieved were NOT returned by any "
+                "database for this variant. Do not supply them from prior knowledge. "
+                "State that the lookup did not return them, and if you mention such a "
+                "figure anyway, label it explicitly as general knowledge rather than "
+                "as a retrieved result."
+            )
+
+        return json.dumps(payload, indent=2)
     except Exception as e:
         return f"Error analyzing variant {variant_id}: {str(e)}"
 

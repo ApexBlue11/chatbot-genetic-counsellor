@@ -80,11 +80,16 @@ def wrap_label(name: str, font_size: float = NAME_FONT,
         else:
             current = candidate
 
-        # A single word wider than the box has to be split mid-word.
+        # A single word wider than the box has to be broken.
         while text_width(current, font_size) > max_width and len(current) > 1:
             cut = len(current)
             while cut > 1 and text_width(current[:cut], font_size) > max_width:
                 cut -= 1
+            # Break at a hyphen where one falls inside the fitting range:
+            # "Great-/Grandfather" reads as a name, "Great-Grandfat/her" does not.
+            hyphen = current.rfind("-", 1, cut + 1)
+            if hyphen > 0:
+                cut = hyphen + 1
             lines.append(current[:cut])
             current = current[cut:]
 

@@ -9,6 +9,14 @@ class QueryClassification:
     extracted_identifier: Optional[str]
 
 class GenomicQueryRouter:
+    # A gene symbol in parentheses — NM_000492.4(CFTR):c.1521_1523delCTT — is how
+    # ClinVar itself displays a variant, so counselors paste that form constantly.
+    # It is stripped rather than matched, because the downstream APIs want the
+    # bare accession. Without this the string matched nothing, the identifier
+    # resolved to None, and ClinGen/MyVariant/VEP were all silently queried with
+    # None while the model filled the gap from memory.
+    GENE_IN_PARENS = re.compile(r"\((?:[A-Za-z0-9\-]{1,15})\)(?=\s*:)")
+
     HGVS_PATTERNS = {
         "transcript": [
             r"\b(NM_\d+(?:\.\d+)?):c\.[A-Za-z0-9\-+*>_]+",
@@ -26,7 +34,7 @@ class GenomicQueryRouter:
     RSID_PATTERN = r"\b(rs\d+)\b"
 
     def classify(self, query: str) -> QueryClassification:
-        query = query.strip()
+        query = self.GENE_IN_PARENS.sub("", query.strip())
         for vtype, patterns in self.HGVS_PATTERNS.items():
             for pattern in patterns:
                 match = re.search(pattern, query, re.IGNORECASE)
