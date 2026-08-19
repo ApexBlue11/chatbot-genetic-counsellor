@@ -51,16 +51,44 @@ function VariantDetailsTabs({ data }) {
     return gg_af[key] ?? ge_af[key] ?? gg[key] ?? ge[key] ?? 0;
   };
 
+  // VEP carries gnomAD frequencies on colocated_variants[].frequencies, keyed by
+  // the alt allele and spelled gnomade*. Reading only MyVariant meant this tab
+  // said "no population frequency data" for variants VEP had answered for — and
+  // the assistant, which does read VEP, reported frequencies the tab denied
+  // having. Same source, two components, opposite answers.
+  const vepFrequencies = (() => {
+    for (const colocated of vepData?.colocated_variants || []) {
+      const freqs = colocated.frequencies;
+      if (!freqs) continue;
+      const perAllele = Object.values(freqs)[0];
+      if (perAllele && typeof perAllele === 'object') return perAllele;
+    }
+    return {};
+  })();
+
+  const getFreq = (mvKey, vepKey) => {
+    const mv = getAfVal(mvKey);
+    if (mv !== undefined && mv !== null && mv !== 0) return mv;
+    const v = vepFrequencies[vepKey];
+    return v !== undefined && v !== null ? v : mv;
+  };
+
   const freqData = [
-    { name: 'Global', value: getAfVal('af') },
-    { name: 'African', value: getAfVal('af_afr') || getAfVal('af_afr_raw') },
-    { name: 'Latino', value: getAfVal('af_amr') || getAfVal('af_admixt') },
-    { name: 'European (Non-Finnish)', value: getAfVal('af_nfe') },
-    { name: 'European (Finnish)', value: getAfVal('af_fin') },
-    { name: 'Ashkenazi Jewish', value: getAfVal('af_asj') },
-    { name: 'East Asian', value: getAfVal('af_eas') },
-    { name: 'South Asian', value: getAfVal('af_sas') },
+    { name: 'Global', value: getFreq('af', 'gnomade') },
+    { name: 'African', value: getFreq('af_afr', 'gnomade_afr') },
+    { name: 'Latino', value: getFreq('af_amr', 'gnomade_amr') },
+    { name: 'European (Non-Finnish)', value: getFreq('af_nfe', 'gnomade_nfe') },
+    { name: 'European (Finnish)', value: getFreq('af_fin', 'gnomade_fin') },
+    { name: 'Ashkenazi Jewish', value: getFreq('af_asj', 'gnomade_asj') },
+    { name: 'East Asian', value: getFreq('af_eas', 'gnomade_eas') },
+    { name: 'South Asian', value: getFreq('af_sas', 'gnomade_sas') },
   ].filter(d => d.value !== undefined && d.value !== null);
+
+  // gnomAD answering "zero everywhere" is a real finding — the variant is
+  // catalogued but unobserved. A bar chart of zeros cannot show it, and the
+  // empty-state text ("no data available") states the opposite of the truth.
+  const hasAnyFrequency = freqData.some(d => d.value > 0);
+  const reportedAbsent = !hasAnyFrequency && Object.keys(vepFrequencies).length > 0;
 
   // An rsID never contains "del" or "ins", so keying off the query string meant
   // this note never appeared for the exact case it exists to explain: an indel
@@ -216,7 +244,10 @@ function VariantDetailsTabs({ data }) {
                 </div>
               </div>
             ) : (
-              <div style={{ color: 'var(--text-secondary)' }}>No summary record available.</div>
+              <div style={{ color: 'var(--text-secondary)' }}>
+                Not catalogued in ClinVar — no submitted interpretation exists for this
+                variant, which is not the same as an interpretation of benign.
+              </div>
             )}
             
             {/* Detailed Submissions from MyVariant */}
@@ -274,7 +305,15 @@ function VariantDetailsTabs({ data }) {
               </div>
             ) : (
               <div>
-                <div style={{ color: 'var(--text-secondary)' }}>No dbNSFP predictors available.</div>
+                {/* "No predictors available" reads as a failed lookup. For a 3' UTR
+                    or splice variant nothing failed — dbNSFP scores missense
+                    substitutions and this is not one. Name the reason. */}
+                <div style={{ color: 'var(--text-secondary)' }}>
+                  {consequenceText && !/missense/.test(consequenceText)
+                    ? `No dbNSFP predictors apply. SIFT, PolyPhen-2 and REVEL score missense
+                       substitutions; this is a ${consequenceText.replace(/_/g, ' ')}.`
+                    : 'No dbNSFP predictors available for this variant.'}
+                </div>
                 {isIndel && (
                   <div style={{ marginTop: '0.5rem', padding: '0.75rem', background: '#FEF3C7', color: '#B45309', borderRadius: '4px', fontSize: '0.85rem' }}>
                     <strong>Note on Indels:</strong> Predictors like SIFT, PolyPhen, and REVEL are primarily trained on and calculate scores for Single Nucleotide Variants (SNVs). As this variant involves an insertion or deletion (Indel), these scores are generally not applicable or available.
@@ -288,7 +327,18 @@ function VariantDetailsTabs({ data }) {
         {activeTab === 'population' && (
           <div>
             <h4 style={{ marginBottom: '0.5rem', color: 'var(--text-primary)' }}>gnomAD Allele Frequencies</h4>
-            {getAfVal('af') > 0 || freqData.some(d => d.value > 0) ? (
+            {reportedAbsent ? (
+              <div style={{ fontSize: '0.85rem', lineHeight: 1.6 }}>
+                <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                  Not observed in gnomAD
+                </div>
+                <div style={{ color: 'var(--text-secondary)', marginTop: '0.35rem' }}>
+                  gnomAD reports zero observations across every ancestry group it
+                  returned. The variant is catalogued in dbSNP but was not seen in this
+                  release — absent, rather than a measured frequency of zero.
+                </div>
+              </div>
+            ) : hasAnyFrequency ? (
               <div style={{ height: 200, width: '100%', marginTop: '1rem' }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={freqData.filter(d => d.value > 0)} layout="vertical" margin={{ left: 20 }}>

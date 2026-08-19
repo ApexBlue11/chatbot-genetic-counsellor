@@ -336,35 +336,66 @@ def query_pubmed(query_term: str) -> List[Dict[str, Any]]:
             log_api_step("PUBMED_EMPTY", f"No papers found for term: '{query_term}'")
             return []
             
-        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-        summary_params = {
-            "db": "pubmed",
-            "id": ",".join(id_list),
-            "retmode": "json"
-        }
-        log_api_step("PUBMED_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {id_list}")
-        resp2 = requests.get(summary_url, params=summary_params, timeout=15)
-        resp2.raise_for_status()
-        summary_data = resp2.json()
-        
-        results = []
-        result_dict = summary_data.get("result", {})
-        for pmid in id_list:
-            if pmid in result_dict:
-                paper = result_dict[pmid]
-                results.append({
-                    "pmid": pmid,
-                    "title": paper.get("title", "No Title"),
-                    "authors": ", ".join(author.get("name", "") for author in paper.get("authors", [])),
-                    "journal": paper.get("source", "Unknown Journal"),
-                    "pubdate": paper.get("pubdate", "Unknown Date"),
-                    "link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-                })
+        results = fetch_pubmed_by_ids(id_list)
         log_api_step("PUBMED_PARSE", f"Successfully parsed {len(results)} PubMed papers", results)
         return results
     except Exception as e:
         log_api_step("PUBMED_ERROR", f"Error querying PubMed: {str(e)}")
         return []
+
+
+def fetch_pubmed_by_ids(pmids: List[Any]) -> List[Dict[str, Any]]:
+    """Resolve PMIDs to citation records.
+
+    dbSNP already curates the papers that describe a variant, and VEP hands them
+    back on colocated_variants[].pubmed. Those are far better than anything a
+    keyword search reconstructs — searching "DHFR 3 prime UTR variant" returns
+    nothing at all — so this exists to turn that ready-made list into citations.
+    """
+    ids = [str(p).strip() for p in (pmids or []) if str(p).strip().isdigit()]
+    if not ids:
+        return []
+
+    summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+    summary_params = {"db": "pubmed", "id": ",".join(ids), "retmode": "json"}
+    try:
+        log_api_step("PUBMED_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {ids}")
+        resp = requests.get(summary_url, params=summary_params, timeout=15)
+        resp.raise_for_status()
+        result_dict = resp.json().get("result", {})
+    except Exception as e:
+        log_api_step("PUBMED_ERROR", f"Error fetching PubMed summaries: {str(e)}")
+        return []
+
+    results = []
+    for pmid in ids:
+        paper = result_dict.get(pmid)
+        if not paper:
+            continue
+        results.append({
+            "pmid": pmid,
+            "title": paper.get("title", "No Title"),
+            "authors": ", ".join(author.get("name", "") for author in paper.get("authors", [])),
+            "journal": paper.get("source", "Unknown Journal"),
+            "pubdate": paper.get("pubdate", "Unknown Date"),
+            "link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+        })
+    return results
+
+
+def pubmed_ids_from_vep(vep_data: Any) -> List[str]:
+    """PMIDs dbSNP has linked to this exact variant, via VEP's colocated list."""
+    records = vep_data if isinstance(vep_data, list) else [vep_data]
+    out: List[str] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        for colocated in rec.get("colocated_variants") or []:
+            for pmid in colocated.get("pubmed") or []:
+                pid = str(pmid).strip()
+                if pid.isdigit() and pid not in out:
+                    out.append(pid)
+    return out
 
 def query_myvariant_batch(ids: List[str]) -> List[Dict[str, Any]]:
     """Query MyVariant.info in batch via POST with intelligent routing for rsIDs vs HGVS."""

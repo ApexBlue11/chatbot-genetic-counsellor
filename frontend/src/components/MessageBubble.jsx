@@ -43,7 +43,17 @@ function MessageBubble({ message }) {
         <div className="message-metadata">
           {metadata.literature && metadata.literature.length > 0 && (
             <div style={{ marginBottom: '1rem', paddingBottom: '1rem', borderBottom: '1px solid var(--border-color)' }}>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem' }}>📚 Literature References</div>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem' }}>
+                📚 Literature References
+                {/* A gene-level fallback search is background reading, not evidence
+                    about this variant. Saying which one the reader is looking at
+                    is the difference between a citation and a lead. */}
+                <span style={{ fontWeight: 400, color: 'var(--text-secondary)', marginLeft: '0.4rem' }}>
+                  {metadata.literature[0]?.scope === 'gene'
+                    ? '— recent papers on the gene; none are linked to this variant'
+                    : '— linked to this variant in dbSNP'}
+                </span>
+              </div>
               <ul style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', paddingLeft: '1.25rem' }}>
                 {metadata.literature.map((p, i) => (
                   <li key={i}><a href={p.link} target="_blank" rel="noreferrer" style={{color: 'var(--primary)', textDecoration: 'none'}}>{p.title}</a> - {p.journal}</li>

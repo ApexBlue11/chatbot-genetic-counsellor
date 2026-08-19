@@ -8,6 +8,7 @@ from core.gemini_client import (
     init_gemini, detect_rsid, detect_hgvs,
     generate_with_fallback, generate_with_agent, set_current_conv_id
 )
+from core.api_clients import fetch_pubmed_by_ids, pubmed_ids_from_vep, query_pubmed
 from analysis.variant_analyser import VariantAnalyzer, VariantDataFetcher
 from analysis.vcf_prioritizer import PREDICTOR_GUIDE
 import json
@@ -375,30 +376,44 @@ def handle_single_variant(variant_id, user_input, conversation_id, ai_enabled,
     analysis = analyzer.analyze_variant(variant_data)
     clin_sig = analysis.get("clinical_relevance", {}).get("clinical_significance", "N/A")
 
-    # Gene resolution
-    gene = "Unknown"
+    # Gene resolution.
+    #
+    # VEP used to be left out of this, so a variant that ClinVar and MyVariant
+    # know nothing about resolved to "Unknown" even when VEP had named the gene
+    # outright. rs34764978 is the case: VEP returns DHFR on the MANE transcript,
+    # the details table showed DHFR, and the model was still told the gene was
+    # unspecified and duly reported that it could not assess gene-disease
+    # validity.
     clinvar_data = variant_data.get("clinvar_data", {})
     myvariant_data = variant_data.get("myvariant_data", {})
-    if clinvar_data and isinstance(clinvar_data, dict) and clinvar_data.get("gene_symbol"):
-        gene = clinvar_data["gene_symbol"]
-    elif myvariant_data and isinstance(myvariant_data, dict):
-        for candidate in [
-            myvariant_data.get("clinvar", {}).get("gene", {}).get("symbol"),
-            (myvariant_data.get("dbnsfp", {}).get("genename") or [None])[0]
-            if isinstance(myvariant_data.get("dbnsfp", {}).get("genename"), list)
-            else myvariant_data.get("dbnsfp", {}).get("genename"),
-        ]:
-            if candidate:
-                gene = candidate
-                break
+    gene = _resolve_gene(clinvar_data, myvariant_data, variant_data.get("vep_data"))
+
+    # Papers dbSNP has linked to this exact variant. The fast path never looked
+    # for literature at all, so an answer here carried no citations while the
+    # agent path cited freely — and for rs34764978 the linked set is squarely on
+    # point (DHFR 3'UTR miRNA binding, methotrexate response).
+    literature = fetch_pubmed_by_ids(pubmed_ids_from_vep(variant_data.get("vep_data"))[:6])
+    lit_scope = "variant" if literature else "none"
+    if not literature and gene != "Unknown":
+        # Nothing variant-specific. A gene-level search at least gives the
+        # counselor somewhere to start, but it must be labelled as such: these
+        # are recent papers about the gene, not evidence about this variant, and
+        # presenting them as variant-linked would invite exactly the kind of
+        # citation the grounding rule exists to prevent.
+        literature = query_pubmed(f"{gene}[Gene] AND (variant OR polymorphism OR mutation)")[:5]
+        lit_scope = "gene" if literature else "none"
+    for paper in literature:
+        paper["scope"] = lit_scope
 
     meta = {
         "type": "variant_analysis",
         "variant_id": variant_id,
+        "gene": gene,
         "pathogenicity": analysis["pathogenicity_prediction"]["classification"],
         "confidence": analysis["pathogenicity_prediction"]["confidence"],
         "protein_effect": analysis["functional_impact"]["protein_effect"],
         "clinical_significance": clin_sig,
+        "literature": literature,
         "raw_data": variant_data,
     }
     summary = (
@@ -411,7 +426,8 @@ def handle_single_variant(variant_id, user_input, conversation_id, ai_enabled,
         if genai:
             set_current_conv_id(conversation_id)
             prompt = _build_variant_prompt(
-                variant_id, gene, variant_data, analysis, user_input, thinking_enabled
+                variant_id, gene, variant_data, analysis, user_input, thinking_enabled,
+                literature,
             )
             try:
                 response_text, model_used = generate_with_fallback(
@@ -454,7 +470,42 @@ def _first(val):
     return val if val not in (None, "", ".") else None
 
 
-def _variant_evidence_block(variant_data, analysis) -> str:
+def _resolve_gene(clinvar_data, myvariant_data, vep_data) -> str:
+    """Gene symbol from whichever source actually knows it.
+
+    Ordered by how specific the source is to this variant: ClinVar's curated
+    record, then MyVariant's annotations, then VEP's transcript consequences —
+    which is the only one that answers for variants no clinical database has
+    catalogued yet.
+    """
+    if isinstance(clinvar_data, dict) and clinvar_data.get("gene_symbol"):
+        return clinvar_data["gene_symbol"]
+
+    if isinstance(myvariant_data, dict):
+        genename = (myvariant_data.get("dbnsfp") or {}).get("genename")
+        for candidate in [
+            ((myvariant_data.get("clinvar") or {}).get("gene") or {}).get("symbol"),
+            genename[0] if isinstance(genename, list) and genename else genename,
+            ((myvariant_data.get("snpeff") or {}).get("ann") or {}).get("genename")
+            if isinstance((myvariant_data.get("snpeff") or {}).get("ann"), dict) else None,
+        ]:
+            if candidate:
+                return candidate
+
+    records = vep_data if isinstance(vep_data, list) else [vep_data]
+    transcripts = []
+    for rec in records:
+        if isinstance(rec, dict):
+            transcripts.extend(rec.get("transcript_consequences") or [])
+    for pick in (lambda t: t.get("mane_select"), lambda t: t.get("canonical") == 1, lambda t: True):
+        for t in transcripts:
+            if pick(t) and t.get("gene_symbol"):
+                return t["gene_symbol"]
+
+    return "Unknown"
+
+
+def _variant_evidence_block(variant_data, analysis, literature=None) -> str:
     """Curated evidence for the single-variant prompt.
 
     This used to be `json.dumps(myvariant_data)[:2000]`. MyVariant records run
@@ -471,7 +522,19 @@ def _variant_evidence_block(variant_data, analysis) -> str:
 
     # ── Population frequency ──
     pop = analysis.get("population_frequency") or {}
-    if pop:
+    afs = [r.get("allele_frequency") for r in pop.values()
+           if isinstance(r, dict) and r.get("allele_frequency") is not None]
+    if afs and all(af == 0 for af in afs):
+        # gnomAD answered, and the answer was zero observations everywhere.
+        # Printing nine rows of "0 (0%)" invited the model to read them as nine
+        # separate measurements and cite them as PM2 support; it is one fact.
+        src = next((r.get("source", "gnomAD") for r in pop.values() if isinstance(r, dict)), "gnomAD")
+        lines.append(
+            f"POPULATION FREQUENCY: zero observations in {src} across all "
+            f"{len(afs)} ancestry groups reported. The variant is catalogued in dbSNP but "
+            "was not seen in this gnomAD release — treat as absent, not as a measured 0%."
+        )
+    elif afs:
         lines.append("POPULATION FREQUENCY (gnomAD):")
         for label, rec in pop.items():
             if not isinstance(rec, dict):
@@ -537,11 +600,25 @@ def _variant_evidence_block(variant_data, analysis) -> str:
         lines.append(f"  Submitted interpretations ({len(rcvs)} records): " +
                      "; ".join(f"{k} x{v}" for k, v in tally.most_common()))
 
+    if literature:
+        if literature[0].get("scope") == "gene":
+            lines.append(
+                "LITERATURE (gene-level search — NOT specific to this variant; dbSNP links "
+                "no papers to it. Cite these as background on the gene, never as evidence "
+                "about this variant):"
+            )
+        else:
+            lines.append("LITERATURE (PubMed records dbSNP links to this exact variant):")
+        for paper in literature:
+            lines.append(f"  [PMID: {paper['pmid']}] {paper['title']} — {paper['journal']} {paper.get('pubdate', '')}".rstrip())
+    else:
+        lines.append("LITERATURE: no PubMed records retrieved for this variant.")
+
     return "\n".join(lines)
 
 
 def _build_variant_prompt(variant_id, gene, variant_data, analysis, user_input,
-                          thinking_enabled=False):
+                          thinking_enabled=False, literature=None):
     # Same split as the agent path: Thinking mode buys the audit trail and costs
     # the wait; with it off the counselor wants the interpretation on its own.
     if thinking_enabled:
@@ -568,14 +645,15 @@ Protein Effect: {analysis['functional_impact']['protein_effect']}
 Clinical Significance: {analysis.get('clinical_relevance', {}).get('clinical_significance', 'N/A')}
 
 RETRIEVED EVIDENCE:
-{_variant_evidence_block(variant_data, analysis)}
+{_variant_evidence_block(variant_data, analysis, literature)}
 
 GROUNDING: the block above is everything that was actually retrieved for this
 variant. If something is missing from it - no gnomAD frequencies, no predictor
 scores - say it was not retrieved rather than supplying the number from prior
 knowledge. General knowledge is fine when labelled as such; it must never be
-presented as a database lookup. This path does not call PubMed, so do not cite
-PMIDs as though a search returned them.
+presented as a database lookup. Cite only the PMIDs listed above, as markdown
+links ([PMID: 12345678](https://pubmed.ncbi.nlm.nih.gov/12345678/)); if none are
+listed, say so rather than recalling citations.
 
 {closing}"""
     return prompt
