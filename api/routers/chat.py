@@ -8,7 +8,9 @@ from core.gemini_client import (
     init_gemini, detect_rsid, detect_hgvs,
     generate_with_fallback, generate_with_agent, set_current_conv_id
 )
-from core.api_clients import fetch_pubmed_by_ids, pubmed_ids_from_vep, query_pubmed
+from core.api_clients import (
+    fetch_pubmed_by_ids, pubmed_ids_from_vep, query_pubmed, resolve_gene_symbol,
+)
 from analysis.variant_analyser import VariantAnalyzer, VariantDataFetcher
 from analysis.vcf_prioritizer import PREDICTOR_GUIDE
 import json
@@ -245,7 +247,11 @@ def handle_ai_chat(user_input, conversation_id, ped_enabled=False, system_contex
         "\n  • search_pubmed(query_term): Search PubMed for literature. YOU SHOULD SEARCH for every "
         "clinically significant variant you discuss. Formulate your own query based on the clinical context."
         "\n  • Clinical_Variant_Analyzer(variant_id): Deep single-variant analysis (calls live APIs). "
-        "Use for new variants not in the uploaded context."
+        "Use for new variants not in the uploaded context. It returns the gene, the MANE "
+        "transcript, ClinVar review status and submission tally, gnomAD ancestry frequencies, "
+        "SIFT/PolyPhen/REVEL/CADD, and the papers dbSNP links to the variant - so read its "
+        "output before concluding anything is unavailable, and trust data_not_retrieved "
+        "rather than assuming."
         "\n  • read_patient_vcf(patient_label, start_row, end_row): Read raw VCF rows by patient label. "
         "Use when a counselor references specific row numbers."
         "\n  • read_enriched_data(patient_label, variant_ids): Read full pre-computed annotation records "
@@ -460,49 +466,9 @@ def get_variant_details(variant_id: str):
     }
 
 
-def _first(val):
-    """dbNSFP repeats a score once per transcript; they are the same number."""
-    if isinstance(val, list):
-        for v in val:
-            if v not in (None, "", "."):
-                return v
-        return None
-    return val if val not in (None, "", ".") else None
-
-
 def _resolve_gene(clinvar_data, myvariant_data, vep_data) -> str:
-    """Gene symbol from whichever source actually knows it.
-
-    Ordered by how specific the source is to this variant: ClinVar's curated
-    record, then MyVariant's annotations, then VEP's transcript consequences —
-    which is the only one that answers for variants no clinical database has
-    catalogued yet.
-    """
-    if isinstance(clinvar_data, dict) and clinvar_data.get("gene_symbol"):
-        return clinvar_data["gene_symbol"]
-
-    if isinstance(myvariant_data, dict):
-        genename = (myvariant_data.get("dbnsfp") or {}).get("genename")
-        for candidate in [
-            ((myvariant_data.get("clinvar") or {}).get("gene") or {}).get("symbol"),
-            genename[0] if isinstance(genename, list) and genename else genename,
-            ((myvariant_data.get("snpeff") or {}).get("ann") or {}).get("genename")
-            if isinstance((myvariant_data.get("snpeff") or {}).get("ann"), dict) else None,
-        ]:
-            if candidate:
-                return candidate
-
-    records = vep_data if isinstance(vep_data, list) else [vep_data]
-    transcripts = []
-    for rec in records:
-        if isinstance(rec, dict):
-            transcripts.extend(rec.get("transcript_consequences") or [])
-    for pick in (lambda t: t.get("mane_select"), lambda t: t.get("canonical") == 1, lambda t: True):
-        for t in transcripts:
-            if pick(t) and t.get("gene_symbol"):
-                return t["gene_symbol"]
-
-    return "Unknown"
+    """Thin alias so this module keeps its local name for the shared resolver."""
+    return resolve_gene_symbol(clinvar_data, myvariant_data, vep_data)
 
 
 def _variant_evidence_block(variant_data, analysis, literature=None) -> str:
@@ -517,7 +483,6 @@ def _variant_evidence_block(variant_data, analysis, literature=None) -> str:
     shown, for every variant, whether or not the lookup succeeded.
     """
     mv = variant_data.get("myvariant_data") or {}
-    dbnsfp = mv.get("dbnsfp") or {}
     lines = []
 
     # ── Population frequency ──
@@ -547,29 +512,11 @@ def _variant_evidence_block(variant_data, analysis, literature=None) -> str:
         lines.append("POPULATION FREQUENCY: not retrieved (no gnomAD record returned for this variant).")
 
     # ── Functional predictors ──
-    sift = _first(dbnsfp.get("sift", {}).get("pred") if isinstance(dbnsfp.get("sift"), dict) else dbnsfp.get("sift_pred"))
-    sift_score = _first(dbnsfp.get("sift", {}).get("score") if isinstance(dbnsfp.get("sift"), dict) else dbnsfp.get("sift_score"))
-    pp2 = dbnsfp.get("polyphen2") or {}
-    hdiv = pp2.get("hdiv") if isinstance(pp2, dict) else {}
-    polyphen = _first(hdiv.get("pred") if isinstance(hdiv, dict) else dbnsfp.get("polyphen2_hdiv_pred"))
-    polyphen_score = _first(hdiv.get("score") if isinstance(hdiv, dict) else dbnsfp.get("polyphen2_hdiv_score"))
-    revel = _first((dbnsfp.get("revel") or {}).get("score") if isinstance(dbnsfp.get("revel"), dict) else dbnsfp.get("revel_score"))
-    cadd_obj = mv.get("cadd") or dbnsfp.get("cadd") or {}
-    cadd = _first(cadd_obj.get("phred") if isinstance(cadd_obj, dict) else None)
-
-    preds = []
-    if sift is not None:
-        preds.append(f"  SIFT: {sift}" + (f" (score {sift_score})" if sift_score is not None else "") + "  [<0.05 deleterious; missense only]")
-    if polyphen is not None:
-        preds.append(f"  PolyPhen-2 HDIV: {polyphen}" + (f" (score {polyphen_score})" if polyphen_score is not None else "") + "  [>0.85 probably damaging]")
-    if revel is not None:
-        preds.append(f"  REVEL: {revel}  [>0.75 likely pathogenic; most reliable missense ensemble]")
-    if cadd is not None:
-        preds.append(f"  CADD (Phred): {cadd}  [>20 top 1%, >30 top 0.1%; works for all variant types]")
-
-    if preds:
+    predictors = (analysis.get("functional_impact") or {}).get("predictor_scores") or {}
+    if predictors:
         lines.append("FUNCTIONAL PREDICTORS (dbNSFP):")
-        lines.extend(preds)
+        for name, rec in predictors.items():
+            lines.append(f"  {name}: {rec['value']}  [{rec['interpretation']}]")
     else:
         lines.append(
             "FUNCTIONAL PREDICTORS: not retrieved. dbNSFP is trained on missense SNVs, "

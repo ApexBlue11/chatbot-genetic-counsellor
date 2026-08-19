@@ -165,3 +165,121 @@ class TestVepPubmedExtraction(unittest.TestCase):
         self.assertEqual(pubmed_ids_from_vep([]), [])
         self.assertEqual(pubmed_ids_from_vep([{"colocated_variants": [{"id": "rs1"}]}]), [])
         self.assertEqual(pubmed_ids_from_vep({"error": "boom"}), [])
+
+
+class TestPredictorExtraction(unittest.TestCase):
+    """The agent's variant tool read functional_impact["predictor_scores"], a key
+    the analyser never produced. Every lookup therefore reported "functional
+    predictor scores were NOT returned by any database" — including variants
+    whose record carried SIFT, PolyPhen-2, REVEL and CADD. Telling the model a
+    score is absent is worse than silence: it repeats it to the counselor."""
+
+    def setUp(self):
+        self.analyzer = VariantAnalyzer()
+
+    def test_reads_the_nested_dbnsfp_shape(self):
+        scores = self.analyzer.extract_predictor_scores({
+            "dbnsfp": {
+                "sift": {"pred": ["D", "D"], "score": [0.002, 0.027]},
+                "polyphen2": {"hdiv": {"pred": ["D"], "score": [0.998]}},
+                "revel": {"score": [0.842, 0.842]},
+            },
+            "cadd": {"phred": 25.0},
+        })
+        self.assertEqual(scores["SIFT"]["value"], "D")
+        self.assertEqual(scores["SIFT_score"]["value"], 0.002)
+        self.assertEqual(scores["PolyPhen2_HDIV"]["value"], "D")
+        self.assertEqual(scores["REVEL"]["value"], 0.842)
+        self.assertEqual(scores["CADD_phred"]["value"], 25.0)
+
+    def test_reads_the_flat_dbnsfp_shape(self):
+        scores = self.analyzer.extract_predictor_scores({
+            "dbnsfp": {"sift_pred": "T", "sift_score": 0.4, "revel_score": 0.1},
+        })
+        self.assertEqual(scores["SIFT"]["value"], "T")
+        self.assertEqual(scores["REVEL"]["value"], 0.1)
+
+    def test_every_score_carries_how_to_read_it(self):
+        scores = self.analyzer.extract_predictor_scores({"dbnsfp": {"revel_score": 0.9}})
+        self.assertIn("0.75", scores["REVEL"]["interpretation"])
+
+    def test_absent_predictors_yield_nothing_rather_than_zeros(self):
+        # A frameshift has no missense scores. Empty is correct; inventing a 0
+        # would read as "benign" to anyone scanning the column.
+        self.assertEqual(self.analyzer.extract_predictor_scores({}), {})
+        self.assertEqual(self.analyzer.extract_predictor_scores({"dbnsfp": {}}), {})
+        self.assertEqual(self.analyzer.extract_predictor_scores({"dbnsfp": {"sift_pred": "."}}), {})
+
+    def test_analyze_variant_actually_exposes_the_key_the_agent_tool_reads(self):
+        result = self.analyzer._predict_functional_impact(
+            {"dbnsfp": {"revel_score": 0.5}}, []
+        )
+        self.assertIn("predictor_scores", result)
+        self.assertEqual(result["predictor_scores"]["REVEL"]["value"], 0.5)
+
+
+class TestTransientFailureRetry(unittest.TestCase):
+    """Lookups used to fail on the first dropped connection and come back as
+    "Error analyzing variant X" — then succeed on a manual retry a moment later.
+    The retry policy only covered 429, so nothing else was ever tried again."""
+
+    def setUp(self):
+        import requests
+        from core import api_clients
+        self.requests = requests
+        self.api_clients = api_clients
+
+    def _http_error(self, status):
+        response = self.requests.Response()
+        response.status_code = status
+        err = self.requests.exceptions.HTTPError(f"{status} error")
+        err.response = response
+        return err
+
+    def test_connection_level_failures_are_transient(self):
+        for exc in (self.requests.exceptions.ConnectionError("reset by peer"),
+                    self.requests.exceptions.Timeout("timed out"),
+                    self.requests.exceptions.ChunkedEncodingError("bad chunk")):
+            self.assertTrue(self.api_clients._is_transient(exc), exc)
+
+    def test_rate_limits_and_upstream_5xx_are_transient(self):
+        for status in (429, 500, 502, 503, 504):
+            self.assertTrue(self.api_clients._is_transient(self._http_error(status)), status)
+
+    def test_client_errors_are_not_retried(self):
+        # A 404 means this variant is not there and will not be there next time.
+        for status in (400, 404, 422):
+            self.assertFalse(self.api_clients._is_transient(self._http_error(status)), status)
+        self.assertFalse(self.api_clients._is_transient(ValueError("bad json")))
+
+    def test_recovers_when_a_later_attempt_succeeds(self):
+        attempts = []
+
+        def flaky():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise self.requests.exceptions.ConnectionError("reset by peer")
+            return "recovered"
+
+        result = self.api_clients.retry_with_backoff(flaky, max_retries=3, initial_delay=0.01)
+        self.assertEqual(result, "recovered")
+        self.assertEqual(len(attempts), 3)
+
+    def test_a_permanent_error_fails_on_the_first_attempt(self):
+        attempts = []
+
+        def hard_fail():
+            attempts.append(1)
+            raise self._http_error(404)
+
+        with self.assertRaises(self.requests.exceptions.HTTPError):
+            self.api_clients.retry_with_backoff(hard_fail, max_retries=3, initial_delay=0.01)
+        self.assertEqual(len(attempts), 1)
+
+    def test_exhaustion_reraises_the_real_error(self):
+        # "Max retries exceeded" hid what actually went wrong.
+        def always():
+            raise self.requests.exceptions.ConnectionError("reset by peer")
+
+        with self.assertRaises(self.requests.exceptions.ConnectionError):
+            self.api_clients.retry_with_backoff(always, max_retries=2, initial_delay=0.01)

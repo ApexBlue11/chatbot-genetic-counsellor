@@ -27,27 +27,48 @@ def log_api_step(step_name: str, message: str, raw_payload: Any = None):
     API_LOGS.append(log_entry)
     print(f"[{log_entry['timestamp']}] [{step_name}] {message}")
 
+# Retried: rate limits, upstream 5xx, and the connection resets and read
+# timeouts NCBI and Ensembl produce under load. Not retried: any other 4xx,
+# which means the request itself is wrong and will fail identically next time.
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Whether a failure is worth trying again.
+
+    The old policy retried on 429 alone, so a dropped connection or a 503 from
+    NCBI failed the whole lookup on the first attempt — the variant would come
+    back as an error and, a moment later, succeed on a manual retry. Those are
+    exactly the failures a retry is for.
+    """
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        return status in _RETRY_STATUS
+    return "429" in str(exc)
+
+
 def retry_with_backoff(func, max_retries=3, initial_delay=1):
-    """Retry a function with exponential backoff for rate limiting."""
+    """Retry a network call with exponential backoff while the failure looks transient."""
+    last_exc = None
     for attempt in range(max_retries):
         try:
             return func()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:  # Rate limit
-                if attempt < max_retries - 1:
-                    delay = initial_delay * (2 ** attempt)
-                    log_api_step("RATE_LIMIT", f"Rate limit hit (429). Retrying in {delay}s... (Attempt {attempt+1}/{max_retries})")
-                    time.sleep(delay)
-                    continue
-            raise
         except Exception as e:
-            if attempt < max_retries - 1 and "429" in str(e):
-                delay = initial_delay * (2 ** attempt)
-                log_api_step("RATE_LIMIT", f"Rate limit hit (429-like error). Retrying in {delay}s... (Attempt {attempt+1}/{max_retries})")
-                time.sleep(delay)
-                continue
-            raise
-    raise Exception("Max retries exceeded")
+            last_exc = e
+            if attempt >= max_retries - 1 or not _is_transient(e):
+                raise
+            delay = initial_delay * (2 ** attempt)
+            log_api_step(
+                "RETRY",
+                f"Transient failure ({type(e).__name__}: {str(e)[:120]}). "
+                f"Retrying in {delay}s... (Attempt {attempt+1}/{max_retries})"
+            )
+            time.sleep(delay)
+    raise last_exc if last_exc else Exception("Max retries exceeded")
 
 def query_clingen(hgvs: str) -> Dict[str, Any]:
     """Query ClinGen Allele Registry API for variant information."""
@@ -175,11 +196,14 @@ def query_vep(hgvs: str) -> Dict[str, Any]:
         # hgvs adds the c. and p. notation the counselor reads.
         params = {"canonical": 1, "mane": 1, "hgvs": 1}
         log_api_step("VEP_HTTP_REQUEST", f"GET Request to: {url} with params {params}")
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        
-        log_api_step("VEP_HTTP_RESPONSE", f"HTTP Status: {resp.status_code}")
-        resp.raise_for_status()
-        
+
+        def _request():
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            log_api_step("VEP_HTTP_RESPONSE", f"HTTP Status: {r.status_code}")
+            r.raise_for_status()
+            return r
+
+        resp = retry_with_backoff(_request, max_retries=3, initial_delay=2)
         data = resp.json()
         log_api_step("VEP_PARSE", "Successfully parsed VEP response", data)
         return data
@@ -212,10 +236,14 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
     
     try:
         log_api_step("CLINVAR_SEARCH_REQUEST", f"GET Search Request to: {search_url} with term: '{search_term}'")
-        search_resp = requests.get(search_url, params=search_params, timeout=15)
-        
-        log_api_step("CLINVAR_SEARCH_RESPONSE", f"HTTP Status: {search_resp.status_code}")
-        search_resp.raise_for_status()
+
+        def _search():
+            r = requests.get(search_url, params=search_params, timeout=15)
+            log_api_step("CLINVAR_SEARCH_RESPONSE", f"HTTP Status: {r.status_code}")
+            r.raise_for_status()
+            return r
+
+        search_resp = retry_with_backoff(_search, max_retries=3, initial_delay=2)
         search_data = search_resp.json()
         log_api_step("CLINVAR_SEARCH_RAW", "Raw esearch response payload", search_data)
         
@@ -243,10 +271,14 @@ def query_clinvar(variation_id: str = None, rsid: str = None, gene_symbol: Optio
         }
         
         log_api_step("CLINVAR_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {candidate_ids}")
-        summary_resp = requests.get(summary_url, params=summary_params, timeout=15)
-        
-        log_api_step("CLINVAR_SUMMARY_RESPONSE", f"HTTP Status: {summary_resp.status_code}")
-        summary_resp.raise_for_status()
+
+        def _summary():
+            r = requests.get(summary_url, params=summary_params, timeout=15)
+            log_api_step("CLINVAR_SUMMARY_RESPONSE", f"HTTP Status: {r.status_code}")
+            r.raise_for_status()
+            return r
+
+        summary_resp = retry_with_backoff(_summary, max_retries=3, initial_delay=2)
         summary_data = summary_resp.json()
         log_api_step("CLINVAR_SUMMARY_RAW", "Raw esummary response payload", summary_data)
         
@@ -328,9 +360,13 @@ def query_pubmed(query_term: str) -> List[Dict[str, Any]]:
     }
     try:
         log_api_step("PUBMED_SEARCH_REQUEST", f"GET Search Request to: {search_url} with query '{query_term}'")
-        resp = requests.get(search_url, params=search_params, timeout=15)
-        resp.raise_for_status()
-        search_data = resp.json()
+
+        def _search():
+            r = requests.get(search_url, params=search_params, timeout=15)
+            r.raise_for_status()
+            return r
+
+        search_data = retry_with_backoff(_search, max_retries=3, initial_delay=2).json()
         id_list = search_data.get("esearchresult", {}).get("idlist", [])
         if not id_list:
             log_api_step("PUBMED_EMPTY", f"No papers found for term: '{query_term}'")
@@ -360,9 +396,13 @@ def fetch_pubmed_by_ids(pmids: List[Any]) -> List[Dict[str, Any]]:
     summary_params = {"db": "pubmed", "id": ",".join(ids), "retmode": "json"}
     try:
         log_api_step("PUBMED_SUMMARY_REQUEST", f"GET Summary Request to: {summary_url} for IDs: {ids}")
-        resp = requests.get(summary_url, params=summary_params, timeout=15)
-        resp.raise_for_status()
-        result_dict = resp.json().get("result", {})
+
+        def _summary():
+            r = requests.get(summary_url, params=summary_params, timeout=15)
+            r.raise_for_status()
+            return r
+
+        result_dict = retry_with_backoff(_summary, max_retries=3, initial_delay=2).json().get("result", {})
     except Exception as e:
         log_api_step("PUBMED_ERROR", f"Error fetching PubMed summaries: {str(e)}")
         return []
@@ -382,6 +422,58 @@ def fetch_pubmed_by_ids(pmids: List[Any]) -> List[Dict[str, Any]]:
         })
     return results
 
+
+
+def primary_transcript(vep_data: Any) -> Optional[Dict[str, Any]]:
+    """The transcript a clinical report would quote.
+
+    MANE Select first — it is the accession ClinVar reports against — then
+    Ensembl canonical, then whatever came back first. VEP only annotates the
+    first two when the query asks for them, which query_vep now does.
+    """
+    records = vep_data if isinstance(vep_data, list) else [vep_data]
+    transcripts: List[Dict[str, Any]] = []
+    for rec in records:
+        if isinstance(rec, dict):
+            transcripts.extend(rec.get("transcript_consequences") or [])
+    for pick in (lambda t: bool(t.get("mane_select")),
+                 lambda t: "MANE_SELECT" in (t.get("flags") or []),
+                 lambda t: t.get("canonical") == 1,
+                 lambda t: True):
+        for t in transcripts:
+            if isinstance(t, dict) and pick(t):
+                return t
+    return None
+
+
+def resolve_gene_symbol(clinvar_data: Any, myvariant_data: Any, vep_data: Any) -> str:
+    """Gene symbol from whichever source actually knows it.
+
+    Ordered by how specific the source is to this variant: ClinVar's curated
+    record, then MyVariant's annotations, then VEP's transcript consequences —
+    the only one that answers for variants no clinical database has catalogued.
+    """
+    if isinstance(clinvar_data, dict) and clinvar_data.get("gene_symbol"):
+        return clinvar_data["gene_symbol"]
+
+    if isinstance(myvariant_data, dict):
+        genename = (myvariant_data.get("dbnsfp") or {}).get("genename")
+        snpeff_ann = (myvariant_data.get("snpeff") or {}).get("ann")
+        if isinstance(snpeff_ann, list):
+            snpeff_ann = snpeff_ann[0] if snpeff_ann else None
+        for candidate in [
+            ((myvariant_data.get("clinvar") or {}).get("gene") or {}).get("symbol"),
+            genename[0] if isinstance(genename, list) and genename else genename,
+            (snpeff_ann or {}).get("genename") if isinstance(snpeff_ann, dict) else None,
+        ]:
+            if candidate:
+                return candidate
+
+    transcript = primary_transcript(vep_data)
+    if transcript and transcript.get("gene_symbol"):
+        return transcript["gene_symbol"]
+
+    return "Unknown"
 
 def pubmed_ids_from_vep(vep_data: Any) -> List[str]:
     """PMIDs dbSNP has linked to this exact variant, via VEP's colocated list."""

@@ -473,8 +473,73 @@ class VariantAnalyzer:
             "protein_effect": protein_effect,
             "domain_affected": domain_affected,
             "structural_impact": structural_impact,
-            "evolutionary_conservation": evolutionary_conservation
+            "evolutionary_conservation": evolutionary_conservation,
+            "predictor_scores": self.extract_predictor_scores(myvariant_data),
         }
+
+    @staticmethod
+    def _first_score(value):
+        """dbNSFP repeats a score once per transcript; they are the same number."""
+        if isinstance(value, list):
+            for item in value:
+                if item not in (None, "", ".", "None"):
+                    return item
+            return None
+        return value if value not in (None, "", ".", "None") else None
+
+    def extract_predictor_scores(self, myvariant_data: Dict[str, Any]) -> Dict[str, Any]:
+        """SIFT / PolyPhen-2 / REVEL / CADD, in whichever shape MyVariant used.
+
+        Nothing read these. The agent's variant tool asked
+        functional_impact["predictor_scores"] for them and that key was never
+        produced, so the tool reported "functional predictor scores were NOT
+        returned by any database" for every variant ever looked up — including
+        rs1801133, whose record carries SIFT D (0.002), PolyPhen-2 D, REVEL
+        0.842 and CADD 25. Telling the model a score is absent is worse than
+        staying quiet about it: the model then says so to the counselor.
+
+        dbNSFP nests these differently depending on the release MyVariant
+        indexed, hence the paired lookups.
+        """
+        mv = myvariant_data or {}
+        dbnsfp = mv.get("dbnsfp") or {}
+        if not isinstance(dbnsfp, dict):
+            return {}
+
+        def nested(parent, *path):
+            node = dbnsfp.get(parent)
+            for key in path:
+                if not isinstance(node, dict):
+                    return None
+                node = node.get(key)
+            return self._first_score(node)
+
+        def flat(key):
+            return self._first_score(dbnsfp.get(key))
+
+        scores: Dict[str, Any] = {}
+
+        def put(name, value, guide):
+            if value is not None:
+                scores[name] = {"value": value, "interpretation": guide}
+
+        put("SIFT", nested("sift", "pred") or flat("sift_pred"),
+            "D = deleterious, T = tolerated; missense substitutions only")
+        put("SIFT_score", nested("sift", "score") or flat("sift_score"),
+            "< 0.05 is deleterious")
+        put("PolyPhen2_HDIV", nested("polyphen2", "hdiv", "pred") or flat("polyphen2_hdiv_pred"),
+            "D = probably damaging, P = possibly damaging, B = benign")
+        put("PolyPhen2_HDIV_score", nested("polyphen2", "hdiv", "score") or flat("polyphen2_hdiv_score"),
+            "> 0.85 is probably damaging")
+        put("REVEL", nested("revel", "score") or flat("revel_score"),
+            "> 0.75 likely pathogenic; the most reliable missense ensemble")
+        put("CADD_phred", self._first_score((mv.get("cadd") or {}).get("phred")
+                                            if isinstance(mv.get("cadd"), dict) else None)
+            or nested("cadd", "phred"),
+            "> 20 is the top 1% most deleterious, > 30 the top 0.1%; applies to all variant types")
+
+        return scores
+
     
     def _assess_clinical_relevance(self, myvariant_data: Dict[str, Any], clinvar_data: Dict[str, Any], vep_data: List[Dict[str, Any]], clingen_data: Dict[str, Any]) -> Dict[str, Any]:
         """Assess the clinical relevance of a variant."""

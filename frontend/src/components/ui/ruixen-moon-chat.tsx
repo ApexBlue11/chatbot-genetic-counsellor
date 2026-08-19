@@ -197,12 +197,15 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
     }
   };
 
-  const handleQuickAction = (text: string) => {
+  const handleQuickAction = (text: string, enablePedigree = false) => {
     if (text.startsWith("Upload")) {
       document.getElementById("vcf-file-input")?.click();
-    } else {
-      setMessage(text);
+      return;
     }
+    // A pedigree example that arrives with the pedigree tool switched off asks
+    // the model to ignore the one instruction that makes the example work.
+    if (enablePedigree) setPedEnabled(true);
+    setMessage(text);
   };
 
   if (!activeConversation) {
@@ -324,19 +327,41 @@ export default function RuixenMoonChat({ activeConversation, onChatUpdated }: Ru
               label="Upload VCF"
               onClick={() => handleQuickAction("Upload")}
             />
+            {/* The examples are the first thing a visitor runs, so they have to
+                exercise the tool rather than skirt it.
+
+                The pedigree was four people over two generations using two of
+                the four status values and no deceased flag — nothing that the
+                layout engine finds interesting. This one is three generations
+                and nine people with carriers, affected, unaffected and deceased
+                grandparents, which is the shape a recessive-condition family
+                actually takes; it lays out with zero connector crossings.
+
+                The variant was rs34764978, which turns out to be about the
+                worst possible choice: absent from ClinVar, no gnomAD record and
+                no dbNSFP scores, so three of the four detail tabs open empty.
+                rs1800562 (HFE c.845G>A, p.Cys282Tyr) fills all of them — expert
+                -reviewed ClinVar record, ancestry frequencies spanning 5.7% in
+                non-Finnish Europeans to 0.011% in East Asians, a full predictor
+                set, and papers dbSNP links to the variant itself. */}
             <QuickAction
               icon={<GitBranch className="h-3.5 w-3.5" />}
               label="Draw a pedigree"
               onClick={() =>
                 handleQuickAction(
-                  "Draw pedigree: Proband (male, affected), Sibling (female, unaffected), Mother (affected), Father (unaffected)"
+                  "Draw a pedigree for this family. The proband is a 34-year-old man " +
+                    "with hereditary haemochromatosis. His sister is a carrier and his " +
+                    "brother is unaffected. Both of his parents are unaffected carriers. " +
+                    "His paternal uncle is also affected, while his paternal aunt is " +
+                    "unaffected. Both paternal grandparents are deceased carriers.",
+                  true
                 )
               }
             />
             <QuickAction
               icon={<Activity className="h-3.5 w-3.5" />}
               label="Analyse a variant"
-              onClick={() => handleQuickAction("Analyze variant rs34764978")}
+              onClick={() => handleQuickAction("Analyze variant rs1800562")}
             />
           </div>
         )}

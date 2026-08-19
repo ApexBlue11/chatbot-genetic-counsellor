@@ -273,11 +273,28 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
 
     variant_id: rsID (e.g. 'rs334') or HGVS notation (e.g. 'NM_000518.5:c.20A>T')
 
-    Returns: pathogenicity classification, confidence, protein effect, clinical significance,
-             associated conditions, all population frequencies, dbNSFP predictor scores.
+    Returns a JSON record containing:
+    - gene symbol, and the MANE Select transcript with its HGVS c. and p. notation
+    - pathogenicity classification, confidence, and the ClinVar review status behind it
+    - clinical significance, associated conditions, and the full submission tally
+      (so a conflict is visible as a conflict rather than as a single verdict)
+    - all gnomAD ancestry frequencies
+    - SIFT, PolyPhen-2 HDIV, REVEL and CADD scores, each with how to read it
+    - PubMed papers dbSNP links to this exact variant, with PMIDs
+
+    Anything the databases did not return is listed under data_not_retrieved. Treat
+    that list as authoritative: those fields were looked up and came back empty, so
+    do not supply them from prior knowledge. Because this tool already returns
+    variant-linked literature, call search_pubmed only for the wider question —
+    the condition, the gene, or the management — not to re-find these papers.
     """
     from core.query_router import GenomicQueryRouter
     from analysis.variant_analyser import VariantDataFetcher, VariantAnalyzer
+    from core.api_clients import (
+        fetch_pubmed_by_ids, pubmed_ids_from_vep,
+        resolve_gene_symbol as _resolve_gene_symbol,
+        primary_transcript as _primary_transcript,
+    )
 
     try:
         router = GenomicQueryRouter()
@@ -294,17 +311,58 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
         frequencies = analysis.get("population_frequency") or {}
         predictors = analysis.get("functional_impact", {}).get("predictor_scores") or {}
 
+        # The agent used to get a classification and nothing to check it against:
+        # no gene, no review status, no transcript, no papers. It then reported
+        # that it could not assess gene-disease validity — for variants where
+        # every one of those facts had been retrieved and thrown away.
+        clinvar_data = variant_data.get("clinvar_data") or {}
+        myvariant_data = variant_data.get("myvariant_data") or {}
+        vep_data = variant_data.get("vep_data")
+
+        gene = _resolve_gene_symbol(clinvar_data, myvariant_data, vep_data)
+        primary = _primary_transcript(vep_data)
+        literature = fetch_pubmed_by_ids(pubmed_ids_from_vep(vep_data)[:6])
+
         payload = {
             "variant": variant_id,
+            "gene": gene,
             "classification": classification.query_type,
             "pathogenicity": analysis["pathogenicity_prediction"]["classification"],
             "confidence": analysis["pathogenicity_prediction"]["confidence"],
+            "clinvar_review_status": clinvar_data.get("review_status"),
+            "clinvar_title": clinvar_data.get("title"),
             "protein_effect": analysis["functional_impact"]["protein_effect"],
             "clinical_significance": analysis.get("clinical_relevance", {}).get("clinical_significance", "N/A"),
             "associated_conditions": analysis.get("clinical_relevance", {}).get("associated_conditions", []),
             "population_frequency": frequencies,
             "predictor_scores": predictors,
         }
+
+        if primary:
+            payload["transcript"] = {
+                "transcript_id": primary.get("transcript_id"),
+                "mane_select": primary.get("mane_select"),
+                "hgvsc": primary.get("hgvsc"),
+                "hgvsp": primary.get("hgvsp"),
+                "impact": primary.get("impact"),
+                "consequence_terms": primary.get("consequence_terms"),
+            }
+
+        # Submitter-level detail, so a lone outlying call cannot be mistaken for
+        # consensus and a conflict is visible as a conflict.
+        rcv = (myvariant_data.get("clinvar") or {}).get("rcv")
+        rcvs = rcv if isinstance(rcv, list) else ([rcv] if rcv else [])
+        if rcvs:
+            from collections import Counter
+            tally = Counter(str(r.get("clinical_significance", "")).strip()
+                            for r in rcvs if r.get("clinical_significance"))
+            payload["clinvar_submissions"] = {"total": len(rcvs), "by_classification": dict(tally)}
+
+        if literature:
+            payload["literature"] = [
+                {"pmid": p["pmid"], "title": p["title"], "journal": p["journal"], "link": p["link"]}
+                for p in literature
+            ]
 
         # Say plainly what came back empty. Silence was being read as "not
         # mentioned" rather than "not retrieved", and the model filled the gap
@@ -315,6 +373,7 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
             ("gnomAD/population frequency", frequencies),
             ("functional predictor scores", predictors),
             ("associated conditions", payload["associated_conditions"]),
+            ("PubMed literature linked to this variant", literature),
         ) if not value]
         if missing:
             payload["data_not_retrieved"] = missing
@@ -328,7 +387,21 @@ def Clinical_Variant_Analyzer(variant_id: str) -> str:
 
         return json.dumps(payload, indent=2)
     except Exception as e:
-        return f"Error analyzing variant {variant_id}: {str(e)}"
+        # A bare error string reads to the model like a gap in the conversation
+        # rather than a failed lookup, and it fills gaps from memory. Say what
+        # failed and what is not allowed to happen next.
+        return json.dumps({
+            "status": "lookup_failed",
+            "variant": variant_id,
+            "error": str(e),
+            "reporting_instruction": (
+                "The database lookup for this variant FAILED after retries — this is a "
+                "transient infrastructure error, not a finding about the variant. Do NOT "
+                "describe the variant from prior knowledge as though it had been retrieved, "
+                "and do NOT conclude anything about its pathogenicity, frequency or "
+                "classification. Tell the counselor the lookup failed and suggest retrying."
+            ),
+        }, indent=2)
 
 
 def read_patient_vcf(patient_label: str, start_row: int, end_row: int) -> str:
